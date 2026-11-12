@@ -1,0 +1,5 @@
+#pragma once
+
+namespace flbr {
+inline constexpr char kFloopHoleLogo[] = R"FH_SVG(@FLOOPHOLE_LOGO@)FH_SVG";
+}

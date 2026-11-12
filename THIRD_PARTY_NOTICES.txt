@@ -1,0 +1,15 @@
+FloopHole third-party notices
+
+FloopHole uses Steinberg VST3 interfaces, LunaSVG, and PlutoVG under their
+respective MIT licenses. Their complete copyright and license notices accompany
+the distribution in VST3-MIT.txt, LunaSVG-MIT.txt, and PlutoVG-MIT.txt.
+
+PlutoVG also includes FreeType-derived rasterization and mathematics code.
+This software is based in part on the work of the FreeType Team.
+Portions of this software are copyright (c) 2000-2003, 2005-2014 The FreeType
+Project (https://www.freetype.org). All rights reserved.
+The FreeType Project License is included unaltered as FTL.TXT.
+
+FloopHole's MIT license applies to its original code and does not replace these
+third-party licenses. No Image-Line software, preset packs, or sample libraries
+are included in the distribution.

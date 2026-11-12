@@ -1,0 +1,12 @@
+#define INIT_CLASS_IID
+#include "pluginterfaces/base/funknown.h"
+#include "pluginterfaces/base/ipluginbase.h"
+#include "pluginterfaces/base/ibstream.h"
+#include "pluginterfaces/vst/ivstcomponent.h"
+#include "pluginterfaces/vst/ivstaudioprocessor.h"
+#include "pluginterfaces/vst/ivsteditcontroller.h"
+#include "pluginterfaces/vst/ivstevents.h"
+#include "pluginterfaces/vst/ivstparameterchanges.h"
+#include "pluginterfaces/vst/ivstprocesscontext.h"
+#include "pluginterfaces/vst/ivstunits.h"
+#include "pluginterfaces/gui/iplugview.h"
