@@ -1,4 +1,9 @@
 # FloopHole
+
+<p align="center">
+  <img src="./src/floophole_logo.svg" alt="FloopHole" width="300" height="300"/>
+</p>  
+
 Open-source VST3 bridge for FL Studio's native instrument and effect plugins on
 macOS and Windows. Each discovered, supported native plugin appears as its own
 DAW entry: **Harmor**, **Sytrus**, **Maximus**, and so on. Instrument and effect
