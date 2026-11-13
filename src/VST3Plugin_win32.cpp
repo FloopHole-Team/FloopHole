@@ -486,7 +486,8 @@ LRESULT CALLBACK FLBridgePlugView::RootWndProc(HWND hwnd, UINT msg, WPARAM wPara
         return reinterpret_cast<LRESULT>(self->m_bgBrush);
     }
     if (msg == WM_APP + 1) {
-        SetFocus(GetParent(hwnd));
+        // Live's immediate editor parent is not its keyboard-input window.
+        SetFocus(GetAncestor(hwnd, GA_ROOT));
         return 0;
     }
     return DefWindowProcW(hwnd, msg, wParam, lParam);
@@ -566,7 +567,6 @@ tresult PLUGIN_API FLBridgePlugView::attached(void* parent, FIDString type) {
     WindowsToolbar::Actions actions;
     actions.preset = [this](int preset) {
         selectPresetFromMenu(preset);
-        PostMessageW(m_rootHwnd, WM_APP + 1, 0, 0);
     };
     actions.previous = [this] { stepPreset(-1); };
     actions.next = [this] { stepPreset(1); };
@@ -790,6 +790,7 @@ void FLBridgePlugView::selectPresetFromMenu(int presetIndex) {
     } else {
         setHintText("Could not load preset. See the host log for details.");
     }
+    PostMessageW(m_rootHwnd, WM_APP + 1, 0, 0);
 }
 
 void FLBridgePlugView::stepPreset(int delta) {
@@ -837,6 +838,7 @@ void FLBridgePlugView::promptLoadFstFile() {
             setHintText("Could not load file. Check its format and permissions; existing packs are not overwritten.");
         }
     }
+    PostMessageW(m_rootHwnd, WM_APP + 1, 0, 0);
 }
 
 void FLBridgePlugView::onTimerTick() {
@@ -849,6 +851,17 @@ void FLBridgePlugView::onTimerTick() {
     }
     if (m_flInstance) {
         m_flInstance->idleEditor();
+        if (m_flInstance->getPluginName() == "FLEX" &&
+            !m_flInstance->wantsEditorKeyboardInput() && !GetCapture() &&
+            !(GetAsyncKeyState(VK_LBUTTON) & 0x8000) &&
+            !(GetAsyncKeyState(VK_RBUTTON) & 0x8000)) {
+            const HWND focused = GetFocus();
+            if (focused && m_pluginHostHwnd &&
+                (focused == m_pluginHostHwnd || IsChild(m_pluginHostHwnd, focused))) {
+                // Native preset selection can leave focus behind without requesting keyboard ownership.
+                SetFocus(GetAncestor(m_rootHwnd, GA_ROOT));
+            }
+        }
     }
 }
 
