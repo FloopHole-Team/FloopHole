@@ -1,7 +1,9 @@
 #include "Win32EditorDrawing.h"
 #include "ToolbarControls_win32.h"
 #include "BridgeEditorLayout.h"
+#include "Win32NewtoneDrag.h"
 #include <algorithm>
+#include <array>
 #include <cstdlib>
 #include <memory>
 
@@ -69,6 +71,102 @@ static void testClassLifetime() {
     CHECK(DestroyWindow(window));
     classes.release();
     CHECK(!GetClassInfoExW(module, L"FloopHoleTestLifecycle", &info));
+}
+
+static void testNewtoneFileDrag() {
+    struct Component {
+        uintptr_t vmt = 0, owner = 0, drag = 0;
+        uint8_t enabled = 0, untouched = 42;
+    } form, panel, source, otherSource;
+    struct Class {
+        std::array<uintptr_t, 26> data{};
+        uintptr_t vmt() { return reinterpret_cast<uintptr_t>(data.data() + 25); }
+        void set(int offset, uintptr_t value) { data[25 + offset / 8] = value; }
+        Class() {
+            set(-200, vmt());
+            set(-128, sizeof(Component));
+        }
+    } formClass, panelClass, sourceClass, baseClass;
+#pragma pack(push, 1)
+    struct {
+        uint16_t count = 1;
+        uintptr_t classes = 0;
+        uint32_t offset = offsetof(Component, drag);
+        uint16_t type = 0;
+        uint8_t length = 7;
+        char name[8] = "DragWAV";
+    } fields;
+    struct {
+        uint8_t kind = 3, length = 7;
+        char name[8] = "Boolean";
+    } boolean;
+    uintptr_t booleanType = reinterpret_cast<uintptr_t>(&boolean);
+    struct {
+        uint8_t kind = 7, nameLength = 0;
+        uintptr_t vmt = 0, parentType = 0;
+        uint16_t total = 1;
+        uint8_t unitLength = 0;
+        uint16_t count = 1;
+        newtoneDrag::Property property{};
+        char name[19] = "SaveFileBeforeDrag";
+    } type;
+#pragma pack(pop)
+    type.property.type = reinterpret_cast<uintptr_t>(&booleanType);
+    type.property.setter = 0xff00000000000000ULL | offsetof(Component, enabled);
+    type.property.nameLength = 18;
+    sourceClass.set(-168, reinterpret_cast<uintptr_t>(&type));
+    formClass.set(-160, reinterpret_cast<uintptr_t>(&fields));
+    form.vmt = formClass.vmt();
+    form.drag = reinterpret_cast<uintptr_t>(&source);
+    source.vmt = otherSource.vmt = sourceClass.vmt();
+    panel.vmt = panelClass.vmt();
+    panel.owner = reinterpret_cast<uintptr_t>(&form);
+    HWND window = CreateWindowExW(0, L"STATIC", L"", WS_POPUP, 0, 0, 10, 10,
+        nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
+    CHECK(window && !newtoneDrag::enable(window));
+    CHECK(SetPropW(window, L"ControlOfsTest", &panel));
+    CHECK(newtoneDrag::enable(window));
+    CHECK(source.enabled == 1 && source.untouched == 42 && otherSource.enabled == 0);
+    CHECK(newtoneDrag::enable(window));
+    form.drag = reinterpret_cast<uintptr_t>(&otherSource);
+    CHECK(newtoneDrag::enable(window));
+    CHECK(otherSource.enabled == 1 && otherSource.untouched == 42 && source.enabled == 1);
+    form.drag = reinterpret_cast<uintptr_t>(&source);
+
+    source.enabled = 0;
+    const auto setter = type.property.setter;
+    type.property.setter = 0xff00000000000000ULL | sizeof(Component);
+    CHECK(!newtoneDrag::enable(window) && source.enabled == 0);
+    type.property.setter = offsetof(Component, enabled);
+    CHECK(!newtoneDrag::enable(window) && source.enabled == 0);
+    type.property.setter = setter;
+    boolean.kind = 1;
+    CHECK(!newtoneDrag::enable(window) && source.enabled == 0);
+    boolean.kind = 3;
+    type.name[0] = 'X';
+    CHECK(!newtoneDrag::enable(window) && source.enabled == 0);
+    type.name[0] = 'S';
+    fields.offset = sizeof(Component);
+    CHECK(!newtoneDrag::enable(window) && source.enabled == 0);
+    fields.offset = offsetof(Component, drag);
+
+    // Published fields and properties can move into ancestor classes.
+    baseClass.set(-160, reinterpret_cast<uintptr_t>(&fields));
+    baseClass.set(-168, reinterpret_cast<uintptr_t>(&type));
+    uintptr_t base = baseClass.vmt();
+    formClass.set(-160, 0);
+    formClass.set(-120, reinterpret_cast<uintptr_t>(&base));
+    sourceClass.set(-168, 0);
+    sourceClass.set(-120, reinterpret_cast<uintptr_t>(&base));
+    CHECK(newtoneDrag::enable(window) && source.enabled == 1);
+    form.owner = reinterpret_cast<uintptr_t>(&form);
+    form.drag = 0;
+    CHECK(!newtoneDrag::enable(window));
+    CHECK(RemovePropW(window, L"ControlOfsTest") == &panel);
+    CHECK(SetPropW(window, L"ControlOfsInvalid", reinterpret_cast<HANDLE>(1)));
+    CHECK(!newtoneDrag::enable(window));
+    CHECK(RemovePropW(window, L"ControlOfsInvalid") == reinterpret_cast<HANDLE>(1));
+    CHECK(DestroyWindow(window));
 }
 
 static void testGripColors() {
@@ -247,6 +345,7 @@ static void testPresetMenuInteractions() {
 
 int main() {
     testClassLifetime();
+    testNewtoneFileDrag();
     testGripColors();
     testPresetMenuItems();
     testPresetMenuInteractions();
@@ -275,6 +374,6 @@ int main() {
         CHECK(!GetClassInfoExW(GetModuleHandleW(nullptr), L"FloopHolePresetMenu", &info));
     }
     CHECK(DestroyWindow(parent));
-    std::puts("Windows editor: repeated graphics sessions, overlapping toolbars, class cleanup and dark grip passed");
+    std::puts("Windows editor: Newtone file drag, repeated graphics sessions, overlapping toolbars, class cleanup and dark grip passed");
     return 0;
 }

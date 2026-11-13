@@ -15,6 +15,7 @@
 
 #include "FLPluginInstance.h"
 #include "FLPathManager.h"
+#include "Win32NewtoneDrag.h"
 #include <stdio.h>
 #include <cmath>
 #include <algorithm>
@@ -814,6 +815,10 @@ bool FLPluginInstance::attachEditorToNSView(void* parentHwnd, int& outWidth, int
     HWND hEditor = *(HWND*)((uint8_t*)m_plug + 0x18);
     if (!hEditor || !IsWindow(hEditor)) {
         hEditor = GetWindow(hParent, GW_CHILD);
+    }
+    if (m_pluginName == "Newtone" && !newtoneDrag::enable(hEditor)) {
+        fprintf(stderr, "FloopHole: cannot enable Newtone file drag export: unsupported native editor metadata\n");
+        if (onHintChanged) onHintChanged("Newtone file drag export is unavailable for this native editor version.");
     }
     if (hEditor && IsWindow(hEditor)) {
         RECT rc{};
