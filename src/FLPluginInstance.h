@@ -115,6 +115,10 @@ public:
     void detachEditor();
     void idleEditor();
     bool isEditorOpen() const { return m_editorOpen; }
+#ifdef _WIN32
+    void setEditorFocus(bool focused);
+    bool wantsEditorKeyboardInput() const { return m_editorWantsKeyboard.load(std::memory_order_relaxed); }
+#endif
 
     // Callbacks to VST3 Controller / UI
     std::function<void(const std::string&)> onHintChanged;
@@ -193,6 +197,9 @@ private:
     bool m_midiNoteForwarded = false;
 
     bool m_editorOpen = false;
+#ifdef _WIN32
+    std::atomic<bool> m_editorWantsKeyboard{false};
+#endif
     void* m_parentNSView = nullptr;
     int m_editorWidth = 900;
     int m_editorHeight = 600;

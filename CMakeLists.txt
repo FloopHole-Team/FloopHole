@@ -313,7 +313,8 @@ if(BUILD_TESTING AND (APPLE OR WIN32))
             src/ToolbarControls_win32.cpp
             src/LogoRenderer.cpp
         )
-        target_include_directories(test_windows_editor PRIVATE src "${CMAKE_CURRENT_BINARY_DIR}/generated")
+        target_include_directories(test_windows_editor PRIVATE
+            src "${CMAKE_CURRENT_BINARY_DIR}/generated" "${VST3_PLUGINTERFACES_DIR}")
         target_link_libraries(test_windows_editor PRIVATE user32 gdi32 gdiplus lunasvg::lunasvg)
         if(MINGW)
             target_link_options(test_windows_editor PRIVATE -static -static-libgcc -static-libstdc++)

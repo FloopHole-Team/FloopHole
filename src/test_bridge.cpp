@@ -739,6 +739,8 @@ static void testPluginCatalog() {
     CHECK(!FLPluginScanner::isPluginExcluded("DirectWave"));
     CHECK(!FLPluginScanner::isPluginExcluded("FL Keys"));
     CHECK(!FLPluginScanner::isPluginExcluded("Newtone"));
+    CHECK(!FLPluginScanner::isPluginExcluded("Edison"));
+    CHECK(!FLPluginScanner::isPluginExcluded("Newtime"));
     CHECK(FLPluginScanner::isPluginExcluded("Patcher"));
     FLPluginScannerTestAccess::setPlugins({});
     CHECK(scanner.getPluginIndices(true).empty());

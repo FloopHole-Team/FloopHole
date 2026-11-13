@@ -7,7 +7,7 @@
 #include <cwchar>
 
 namespace flbr {
-namespace newtoneDrag {
+namespace audioFileDrag {
 
 template<class T>
 inline bool read(uintptr_t address, T& value) {
@@ -23,7 +23,7 @@ inline bool named(uintptr_t address, const char* name) {
                           text, length, nullptr) && std::memcmp(text, name, length) == 0;
 }
 
-// Delphi Win64 VMT and published RTTI layouts, not offsets into a particular Newtone build.
+// Delphi Win64 VMT and published RTTI layouts, not offsets into a particular plugin build.
 inline bool classInfo(uintptr_t object, uintptr_t& vmt, uint32_t& size) {
     uintptr_t self = 0;
     return read(object, vmt) && vmt >= 200 && read(vmt - 200, self) && self == vmt &&
@@ -109,7 +109,7 @@ inline bool saveBeforeDrag(uintptr_t source) {
     return false;
 }
 
-inline bool enable(HWND editor) {
+inline bool enableWindow(HWND editor) {
     bool enabled = false;
     EnumPropsExW(editor, +[](HWND, LPWSTR name, HANDLE value, ULONG_PTR context) -> int {
         if (IS_INTRESOURCE(name) || std::wcsncmp(name, L"ControlOfs", 10) != 0) return TRUE;
@@ -129,5 +129,18 @@ inline bool enable(HWND editor) {
     return enabled;
 }
 
-} // namespace newtoneDrag
+inline bool enable(HWND editor) {
+    if (!editor || !IsWindow(editor)) return false;
+    if (enableWindow(editor)) return true;
+    bool enabled = false;
+    // Edison embeds its audio editor inside a separate wrapper form.
+    EnumChildWindows(editor, +[](HWND child, LPARAM context) -> BOOL {
+        if (!enableWindow(child)) return TRUE;
+        *reinterpret_cast<bool*>(context) = true;
+        return FALSE;
+    }, reinterpret_cast<LPARAM>(&enabled));
+    return enabled;
+}
+
+} // namespace audioFileDrag
 } // namespace flbr

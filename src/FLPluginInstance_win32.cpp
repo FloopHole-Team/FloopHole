@@ -15,7 +15,7 @@
 
 #include "FLPluginInstance.h"
 #include "FLPathManager.h"
-#include "Win32NewtoneDrag.h"
+#include "Win32AudioFileDrag.h"
 #include <stdio.h>
 #include <cmath>
 #include <algorithm>
@@ -809,6 +809,10 @@ bool FLPluginInstance::attachEditorToNSView(void* parentHwnd, int& outWidth, int
     // On Windows, FPD_ShowEditor takes the parent HWND directly and sets m_plug->EditorHandle (+0x18)
     m_fnDispatcher(m_plug, FPD_ShowEditor, 0, (intptr_t)hParent);
     m_editorOpen = true;
+    if (m_pluginName == "Edison") {
+        m_editorWantsKeyboard.store(true, std::memory_order_relaxed);
+        m_fnDispatcher(m_plug, FPD_StealKBFocus, 0, 1);
+    }
 
     outWidth = 900;
     outHeight = 600;
@@ -816,9 +820,12 @@ bool FLPluginInstance::attachEditorToNSView(void* parentHwnd, int& outWidth, int
     if (!hEditor || !IsWindow(hEditor)) {
         hEditor = GetWindow(hParent, GW_CHILD);
     }
-    if (m_pluginName == "Newtone" && !newtoneDrag::enable(hEditor)) {
-        fprintf(stderr, "FloopHole: cannot enable Newtone file drag export: unsupported native editor metadata\n");
-        if (onHintChanged) onHintChanged("Newtone file drag export is unavailable for this native editor version.");
+    if ((m_pluginName == "Newtone" || m_pluginName == "Edison" || m_pluginName == "Newtime") &&
+        !audioFileDrag::enable(hEditor)) {
+        fprintf(stderr, "FloopHole: cannot enable %s file drag export: unsupported native editor metadata\n",
+                m_pluginName.c_str());
+        if (onHintChanged) onHintChanged(m_pluginName +
+            " file drag export is unavailable for this native editor version.");
     }
     if (hEditor && IsWindow(hEditor)) {
         RECT rc{};
@@ -860,11 +867,19 @@ bool FLPluginInstance::resizeEditor(int& width, int& height) {
     return true;
 }
 
+void FLPluginInstance::setEditorFocus(bool focused) {
+    std::lock_guard<std::recursive_mutex> lock(m_mutex);
+    if (m_plug && m_fnDispatcher && m_editorOpen) {
+        m_fnDispatcher(m_plug, FPD_SetFocus, 0, focused ? 1 : 0);
+    }
+}
+
 void FLPluginInstance::detachEditor() {
     std::lock_guard<std::recursive_mutex> lock(m_mutex);
     if (!m_plug || !m_fnDispatcher || !m_editorOpen) return;
     m_fnDispatcher(m_plug, FPD_ShowEditor, 0, 0);
     m_editorOpen = false;
+    m_editorWantsKeyboard.store(false, std::memory_order_relaxed);
 }
 
 void FLPluginInstance::idleEditor() {
@@ -898,6 +913,13 @@ void FLPluginInstance::idleEditor() {
 
 intptr_t FLPluginInstance::handleHostDispatcher(intptr_t sender, intptr_t id, intptr_t index, intptr_t value) {
     switch (id) {
+        case FHD_UpdateStealKBFocus:
+            if (value != 0 && value != 1) {
+                fprintf(stderr, "FloopHole: invalid native editor keyboard ownership %lld\n", (long long)value);
+                return 0;
+            }
+            m_editorWantsKeyboard.store(value != 0, std::memory_order_relaxed);
+            return 1;
         case FHD_SetNumPresets:
             if (value < 0 || value > INT32_MAX) {
                 fprintf(stderr, "FloopHole: invalid native preset count %lld\n", (long long)value);

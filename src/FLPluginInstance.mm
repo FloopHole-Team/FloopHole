@@ -1262,7 +1262,7 @@ bool FLPluginInstance::attachEditorToNSView(void* parentNSView, int& outWidth, i
             outHeight = (int)std::lround(f.size.height);
             [sv setFrameOrigin:NSMakePoint(0, 0)];
             if (m_pluginName == "Harmor" || m_pluginName == "Fruity Scratcher" ||
-                m_pluginName == "3x Osc" || m_pluginName == "Newtone") {
+                m_pluginName == "3x Osc" || m_pluginName == "Newtone" || m_pluginName == "Edison") {
                 NSHashTable<NSView*>* views = [NSHashTable weakObjectsHashTable];
                 objc_setAssociatedObject(parentView, &fileDropViewsKey, views, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
                 installFileDropHandler(sv, this, views);

@@ -51,7 +51,9 @@ constexpr intptr_t FPD_SetTimeSig       = 14;
 constexpr intptr_t FPD_CollectFile      = 15;
 constexpr intptr_t FPD_LoadFile         = 18;
 constexpr intptr_t LFT_Generic          = 0;
+constexpr intptr_t FPD_SetFocus         = 22;
 constexpr intptr_t FPD_RoutingChanged   = 25;
+constexpr intptr_t FPD_StealKBFocus     = 36;
 constexpr intptr_t FPD_SetPlaying       = 12;
 constexpr intptr_t FPD_GetParamInfo     = 26;
 constexpr intptr_t FPD_UseIncreasedMIDIResolution = 50;
@@ -82,6 +84,7 @@ constexpr intptr_t FHD_GetPlaybackTime  = 37;
 constexpr intptr_t FHD_GetInstance      = 46;
 constexpr intptr_t FHD_GetPlugPresetsPath = 47;
 constexpr intptr_t FHD_GetIdleTime      = 48;
+constexpr intptr_t FHD_UpdateStealKBFocus = 67;
 constexpr intptr_t FHD_GetPathManager   = 71; // 0x47 -> returns IPathManager**
 constexpr intptr_t FHD_GetSharedData    = 86; // 0x56
 

@@ -1,7 +1,8 @@
 #include "Win32EditorDrawing.h"
 #include "ToolbarControls_win32.h"
 #include "BridgeEditorLayout.h"
-#include "Win32NewtoneDrag.h"
+#include "Win32AudioFileDrag.h"
+#include "Win32EditorKeyboard.h"
 #include <algorithm>
 #include <array>
 #include <cstdlib>
@@ -73,11 +74,119 @@ static void testClassLifetime() {
     CHECK(!GetClassInfoExW(module, L"FloopHoleTestLifecycle", &info));
 }
 
-static void testNewtoneFileDrag() {
+static void testEditorKeyboard() {
+    using namespace Steinberg;
+    struct Input {
+        bool consume = false;
+        int downs = 0, ups = 0;
+        int rawDowns = 0, rawUps = 0, characters = 0;
+        LPARAM data = 0;
+        std::array<BYTE, 256> modifiers{};
+    } wrapperInput, childInput;
+    Win32WindowClasses classes({{L"FloopHoleTestKeyboard",
+        +[](HWND window, UINT message, WPARAM wp, LPARAM lp) -> LRESULT {
+            auto* input = reinterpret_cast<Input*>(GetWindowLongPtrW(window, GWLP_USERDATA));
+            if (input && (message == WM_KEYDOWN || message == WM_KEYUP || message == WM_CHAR)) {
+                if (message == WM_KEYDOWN) ++input->rawDowns;
+                if (message == WM_KEYUP) ++input->rawUps;
+                if (message == WM_CHAR) ++input->characters;
+                return 0;
+            }
+            if (input && (message == 0xbc00 + WM_KEYDOWN || message == 0xbc00 + WM_KEYUP)) {
+                CHECK(GetKeyboardState(input->modifiers.data()));
+                input->data = lp;
+                if (message == 0xbc00 + WM_KEYUP) {
+                    ++input->ups;
+                    return 0;
+                }
+                ++input->downs;
+                return input->consume && (input->modifiers[VK_CONTROL] & 0x80) &&
+                    (wp == 'C' || wp == 'V' || wp == VK_DELETE);
+            }
+            return DefWindowProcW(window, message, wp, lp);
+        }, 0, nullptr}});
+    HINSTANCE module = classes.acquire();
+    CHECK(module);
+    HWND parent = CreateWindowExW(0, L"STATIC", L"", WS_POPUP, 0, 0, 10, 10,
+        nullptr, nullptr, module, nullptr);
+    HWND container = CreateWindowExW(0, L"STATIC", L"", WS_CHILD, 0, 0, 10, 10,
+        parent, nullptr, module, nullptr);
+    HWND wrapper = CreateWindowExW(0, L"FloopHoleTestKeyboard", L"", WS_CHILD, 0, 0, 10, 10,
+        container, nullptr, module, nullptr);
+    HWND child = CreateWindowExW(0, L"FloopHoleTestKeyboard", L"", WS_CHILD, 0, 0, 10, 10,
+        wrapper, nullptr, module, nullptr);
+    HWND toolbar = CreateWindowExW(0, L"STATIC", L"", WS_CHILD, 0, 0, 10, 10,
+        parent, nullptr, module, nullptr);
+    CHECK(parent && container && wrapper && child && toolbar);
+    SetWindowLongPtrW(wrapper, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(&wrapperInput));
+    SetWindowLongPtrW(child, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(&childInput));
+    wrapperInput.consume = true;
+    SetFocus(child);
+    CHECK(GetFocus() == child);
+    Win32EditorKeyboard keyboard;
+    std::array<BYTE, 256> before{}, after{};
+    CHECK(GetKeyboardState(before.data()));
+    CHECK(!keyboard.keyDown(nullptr, u'c', 0, kCommandKey));
+    CHECK(keyboard.keyDown(container, u'c', 0, kCommandKey));
+    CHECK(wrapperInput.downs == 1 && childInput.downs == 1);
+    CHECK(wrapperInput.modifiers[VK_CONTROL] & 0x80);
+    CHECK(!(wrapperInput.modifiers[VK_SHIFT] & 0x80));
+    CHECK(!(wrapperInput.data & (LPARAM(1) << 30)));
+    CHECK(keyboard.keyDown(container, u'\x03', 0, kCommandKey));
+    CHECK(wrapperInput.downs == 2 && (wrapperInput.data & (LPARAM(1) << 30)));
+    CHECK(keyboard.keyUp(container, u'c', 0, 0));
+    CHECK(wrapperInput.ups == 1 && childInput.ups == 0);
+    CHECK((wrapperInput.data & 0xc0000000LL) == 0xc0000000LL);
+    CHECK(!keyboard.keyUp(container, u'c', 0, 0));
+    CHECK(GetKeyboardState(after.data()) && before == after);
+
+    CHECK(!keyboard.keyDown(container, u'c', 0, kControlKey));
+    CHECK(!keyboard.keyDown(container, u'q', 0, kCommandKey));
+    CHECK(!keyboard.keyUp(container, u'q', 0, kCommandKey));
+    CHECK(keyboard.keyDown(container, 0, CharToVirtualKeyCode('V'), kCommandKey | kShiftKey));
+    CHECK(wrapperInput.modifiers[VK_SHIFT] & 0x80);
+    CHECK(keyboard.keyUp(container, u'v', 0, 0));
+    CHECK(keyboard.keyDown(container, 0, KEY_DELETE, kCommandKey));
+    CHECK(wrapperInput.data & (LPARAM(1) << 24));
+    CHECK(keyboard.keyUp(container, 0, KEY_DELETE, 0));
+    CHECK(Win32EditorKeyboard::virtualKey(0, KEY_F24) == VK_F24);
+    CHECK(Win32EditorKeyboard::virtualKey(0, KEY_ENTER) == VK_RETURN);
+    CHECK(Win32EditorKeyboard::virtualKey(0, -1) == 0);
+
+    wrapperInput.consume = false;
+    CHECK(keyboard.keyDown(container, u'c', 0, kCommandKey, true));
+    CHECK(childInput.rawDowns == 1 && childInput.characters == 0);
+    CHECK(keyboard.keyUp(container, u'c', 0, 0) && childInput.rawUps == 1);
+    CHECK(keyboard.keyDown(container, u'v', 0, kCommandKey, true));
+    CHECK(childInput.rawDowns == 2 && childInput.characters == 0);
+    CHECK(keyboard.keyUp(container, u'v', 0, 0) && childInput.rawUps == 2);
+    CHECK(keyboard.keyDown(container, u'q', 0, 0, true));
+    CHECK(childInput.rawDowns == 3 && childInput.characters == 1);
+    CHECK(keyboard.keyUp(container, u'q', 0, 0));
+    CHECK(wrapperInput.rawDowns == 0 && wrapperInput.rawUps == 0);
+    const int childUps = childInput.ups;
+    childInput.consume = true;
+    const int wrapperDowns = wrapperInput.downs;
+    CHECK(keyboard.keyDown(container, u'c', 0, kCommandKey));
+    CHECK(wrapperInput.downs == wrapperDowns);
+    CHECK(keyboard.keyUp(container, u'c', 0, 0) && childInput.ups == childUps + 1);
+    CHECK(keyboard.keyDown(container, u'v', 0, kCommandKey));
+    keyboard.reset();
+    CHECK(!keyboard.keyUp(container, u'v', 0, 0));
+    SetFocus(toolbar);
+    CHECK(GetFocus() == toolbar && !keyboard.keyDown(container, u'c', 0, kCommandKey, true));
+    SetFocus(container);
+    CHECK(!keyboard.keyDown(container, u'c', 0, kCommandKey));
+    CHECK(GetKeyboardState(after.data()) && before == after);
+    CHECK(DestroyWindow(parent));
+    classes.release();
+}
+
+static void testAudioFileDrag() {
     struct Component {
         uintptr_t vmt = 0, owner = 0, drag = 0;
         uint8_t enabled = 0, untouched = 42;
-    } form, panel, source, otherSource;
+    } form, panel, source, otherSource, nestedForm;
     struct Class {
         std::array<uintptr_t, 26> data{};
         uintptr_t vmt() { return reinterpret_cast<uintptr_t>(data.data() + 25); }
@@ -86,7 +195,7 @@ static void testNewtoneFileDrag() {
             set(-200, vmt());
             set(-128, sizeof(Component));
         }
-    } formClass, panelClass, sourceClass, baseClass;
+    } formClass, panelClass, sourceClass, baseClass, nestedClass;
 #pragma pack(push, 1)
     struct {
         uint16_t count = 1;
@@ -107,7 +216,7 @@ static void testNewtoneFileDrag() {
         uint16_t total = 1;
         uint8_t unitLength = 0;
         uint16_t count = 1;
-        newtoneDrag::Property property{};
+        audioFileDrag::Property property{};
         char name[19] = "SaveFileBeforeDrag";
     } type;
 #pragma pack(pop)
@@ -123,31 +232,48 @@ static void testNewtoneFileDrag() {
     panel.owner = reinterpret_cast<uintptr_t>(&form);
     HWND window = CreateWindowExW(0, L"STATIC", L"", WS_POPUP, 0, 0, 10, 10,
         nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
-    CHECK(window && !newtoneDrag::enable(window));
+    CHECK(window && !audioFileDrag::enable(window));
     CHECK(SetPropW(window, L"ControlOfsTest", &panel));
-    CHECK(newtoneDrag::enable(window));
+    CHECK(audioFileDrag::enable(window));
     CHECK(source.enabled == 1 && source.untouched == 42 && otherSource.enabled == 0);
-    CHECK(newtoneDrag::enable(window));
+    CHECK(audioFileDrag::enable(window));
     form.drag = reinterpret_cast<uintptr_t>(&otherSource);
-    CHECK(newtoneDrag::enable(window));
+    CHECK(audioFileDrag::enable(window));
     CHECK(otherSource.enabled == 1 && otherSource.untouched == 42 && source.enabled == 1);
     form.drag = reinterpret_cast<uintptr_t>(&source);
+
+    CHECK(!audioFileDrag::enable(nullptr));
+    CHECK(!audioFileDrag::enable(reinterpret_cast<HWND>(1)));
+    source.enabled = otherSource.enabled = 0;
+    formClass.set(-160, 0);
+    CHECK(!audioFileDrag::enable(window));
+    nestedClass.set(-160, reinterpret_cast<uintptr_t>(&fields));
+    nestedForm.vmt = nestedClass.vmt();
+    nestedForm.drag = reinterpret_cast<uintptr_t>(&otherSource);
+    HWND child = CreateWindowExW(0, L"STATIC", L"", WS_CHILD, 0, 0, 10, 10,
+        window, nullptr, GetModuleHandleW(nullptr), nullptr);
+    CHECK(child && SetPropW(child, L"ControlOfsNestedEditor", &nestedForm));
+    CHECK(audioFileDrag::enable(window));
+    CHECK(source.enabled == 0 && otherSource.enabled == 1 && otherSource.untouched == 42);
+    CHECK(DestroyWindow(child));
+    CHECK(!audioFileDrag::enable(window));
+    formClass.set(-160, reinterpret_cast<uintptr_t>(&fields));
 
     source.enabled = 0;
     const auto setter = type.property.setter;
     type.property.setter = 0xff00000000000000ULL | sizeof(Component);
-    CHECK(!newtoneDrag::enable(window) && source.enabled == 0);
+    CHECK(!audioFileDrag::enable(window) && source.enabled == 0);
     type.property.setter = offsetof(Component, enabled);
-    CHECK(!newtoneDrag::enable(window) && source.enabled == 0);
+    CHECK(!audioFileDrag::enable(window) && source.enabled == 0);
     type.property.setter = setter;
     boolean.kind = 1;
-    CHECK(!newtoneDrag::enable(window) && source.enabled == 0);
+    CHECK(!audioFileDrag::enable(window) && source.enabled == 0);
     boolean.kind = 3;
     type.name[0] = 'X';
-    CHECK(!newtoneDrag::enable(window) && source.enabled == 0);
+    CHECK(!audioFileDrag::enable(window) && source.enabled == 0);
     type.name[0] = 'S';
     fields.offset = sizeof(Component);
-    CHECK(!newtoneDrag::enable(window) && source.enabled == 0);
+    CHECK(!audioFileDrag::enable(window) && source.enabled == 0);
     fields.offset = offsetof(Component, drag);
 
     // Published fields and properties can move into ancestor classes.
@@ -158,13 +284,13 @@ static void testNewtoneFileDrag() {
     formClass.set(-120, reinterpret_cast<uintptr_t>(&base));
     sourceClass.set(-168, 0);
     sourceClass.set(-120, reinterpret_cast<uintptr_t>(&base));
-    CHECK(newtoneDrag::enable(window) && source.enabled == 1);
+    CHECK(audioFileDrag::enable(window) && source.enabled == 1);
     form.owner = reinterpret_cast<uintptr_t>(&form);
     form.drag = 0;
-    CHECK(!newtoneDrag::enable(window));
+    CHECK(!audioFileDrag::enable(window));
     CHECK(RemovePropW(window, L"ControlOfsTest") == &panel);
     CHECK(SetPropW(window, L"ControlOfsInvalid", reinterpret_cast<HANDLE>(1)));
-    CHECK(!newtoneDrag::enable(window));
+    CHECK(!audioFileDrag::enable(window));
     CHECK(RemovePropW(window, L"ControlOfsInvalid") == reinterpret_cast<HANDLE>(1));
     CHECK(DestroyWindow(window));
 }
@@ -345,7 +471,8 @@ static void testPresetMenuInteractions() {
 
 int main() {
     testClassLifetime();
-    testNewtoneFileDrag();
+    testEditorKeyboard();
+    testAudioFileDrag();
     testGripColors();
     testPresetMenuItems();
     testPresetMenuInteractions();
@@ -374,6 +501,6 @@ int main() {
         CHECK(!GetClassInfoExW(GetModuleHandleW(nullptr), L"FloopHolePresetMenu", &info));
     }
     CHECK(DestroyWindow(parent));
-    std::puts("Windows editor: Newtone file drag, repeated graphics sessions, overlapping toolbars, class cleanup and dark grip passed");
+    std::puts("Windows editor: keyboard shortcuts, audio file drag, repeated graphics sessions, overlapping toolbars, class cleanup and dark grip passed");
     return 0;
 }

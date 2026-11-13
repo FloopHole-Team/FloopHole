@@ -20,6 +20,7 @@
 #include "FloopHoleFactory.h"
 #include "ToolbarControls_win32.h"
 #include "Win32EditorDrawing.h"
+#include "Win32EditorKeyboard.h"
 
 #include "pluginterfaces/base/funknown.h"
 #include "pluginterfaces/base/ipluginbase.h"
@@ -98,11 +99,11 @@ public:
     tresult PLUGIN_API attached(void* parent, FIDString type) override;
     tresult PLUGIN_API removed() override;
     tresult PLUGIN_API onWheel(float distance) override { return kResultFalse; }
-    tresult PLUGIN_API onKeyDown(char16 key, int16 keyCode, int16 modifiers) override { return kResultFalse; }
-    tresult PLUGIN_API onKeyUp(char16 key, int16 keyCode, int16 modifiers) override { return kResultFalse; }
+    tresult PLUGIN_API onKeyDown(char16 key, int16 keyCode, int16 modifiers) override;
+    tresult PLUGIN_API onKeyUp(char16 key, int16 keyCode, int16 modifiers) override;
     tresult PLUGIN_API getSize(ViewRect* size) override;
     tresult PLUGIN_API onSize(ViewRect* newSize) override;
-    tresult PLUGIN_API onFocus(TBool state) override { return kResultOk; }
+    tresult PLUGIN_API onFocus(TBool state) override;
     tresult PLUGIN_API setFrame(IPlugFrame* frame) override { m_plugFrame = frame; return kResultOk; }
     tresult PLUGIN_API canResize() override;
     tresult PLUGIN_API checkSizeConstraint(ViewRect* rect) override;
@@ -159,6 +160,7 @@ private:
     std::unique_ptr<WindowsToolbar> m_toolbar;
     HWND m_pluginHostHwnd = nullptr;
     HBRUSH m_bgBrush = nullptr;
+    Win32EditorKeyboard m_editorKeyboard;
 
 };
 
@@ -490,6 +492,24 @@ LRESULT CALLBACK FLBridgePlugView::RootWndProc(HWND hwnd, UINT msg, WPARAM wPara
     return DefWindowProcW(hwnd, msg, wParam, lParam);
 }
 
+tresult PLUGIN_API FLBridgePlugView::onKeyDown(char16 key, int16 keyCode, int16 modifiers) {
+    if (!m_flInstance || m_flInstance->getPluginName() != "Edison") return kResultFalse;
+    return m_editorKeyboard.keyDown(m_pluginHostHwnd, key, keyCode, modifiers,
+        m_flInstance->wantsEditorKeyboardInput()) ? kResultTrue : kResultFalse;
+}
+
+tresult PLUGIN_API FLBridgePlugView::onKeyUp(char16 key, int16 keyCode, int16 modifiers) {
+    if (!m_flInstance || m_flInstance->getPluginName() != "Edison") return kResultFalse;
+    return m_editorKeyboard.keyUp(m_pluginHostHwnd, key, keyCode, modifiers) ? kResultTrue : kResultFalse;
+}
+
+tresult PLUGIN_API FLBridgePlugView::onFocus(TBool state) {
+    if (!state) m_editorKeyboard.reset();
+    if (m_flInstance && m_flInstance->getPluginName() == "Edison")
+        m_flInstance->setEditorFocus(state != 0);
+    return kResultOk;
+}
+
 tresult PLUGIN_API FLBridgePlugView::attached(void* parent, FIDString type) {
     if (!parent || isPlatformTypeSupported(type) != kResultTrue) {
         return kResultFalse;
@@ -598,6 +618,7 @@ tresult PLUGIN_API FLBridgePlugView::attached(void* parent, FIDString type) {
 }
 
 tresult PLUGIN_API FLBridgePlugView::removed() {
+    m_editorKeyboard.reset();
     if (!m_rootHwnd && !m_windowClassModule && !m_toolbar && !m_gdiplusToken) return kResultOk;
     if (m_toolbar) m_toolbar->closeMenu();
     if (m_volumeKnob && GetCapture() == m_volumeKnob) {
