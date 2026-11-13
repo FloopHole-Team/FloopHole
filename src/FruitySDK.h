@@ -91,6 +91,7 @@ constexpr intptr_t GP_PluginPresetPath = 3;
 constexpr intptr_t GP_SharedDlls = 7;
 
 // ProcessEvent IDs (FPE_*)
+constexpr int32_t FPE_Tempo = 0; // Tempo in float bits in Value, rounded BPM in Flags
 constexpr int32_t FPE_MaxPoly = 1; // Host channel voice limit, delivered through ProcessEvent
 constexpr int32_t FPE_MIDI_Vol = 3; // MIDI volume in Value, normalized float bits in Flags
 

@@ -10,6 +10,9 @@
 
 @interface NSWindow (FLBridgeMacVCLHosting)
 - (NSView*)savedContentView;
+- (void)updateParent;
+- (void)setParent:(NSWindow*)parent;
+- (BOOL)isCustomWindowParented;
 @end
 
 @interface NSObject (FLBridgeMacVCLWindow)
@@ -73,9 +76,83 @@ static Class hostedWindowClass() {
     return subclass;
 }
 
+static char stagingWindowKey;
+static char vstWindowsKey;
+
+static void installVstWindowSafeHandlers() {
+    Class vstWindowClass = NSClassFromString(@"VstWindow");
+    if (!vstWindowClass) return;
+    static bool installed = false;
+    if (installed) return;
+    installed = true;
+    for (SEL selector : {@selector(windowDidBecomeKey:), @selector(windowDidResignKey:)}) {
+        Method method = class_getInstanceMethod(vstWindowClass, selector);
+        if (!method) continue;
+        auto original = reinterpret_cast<void (*)(id, SEL, NSNotification*)>(
+            method_getImplementation(method));
+        IMP safeImp = imp_implementationWithBlock(^(NSWindow* window, NSNotification* notification) {
+            if ([window respondsToSelector:@selector(isCustomWindowParented)] &&
+                [window isCustomWindowParented]) {
+                original(window, selector, notification);
+            }
+        });
+        method_setImplementation(method, safeImp);
+    }
+    for (SEL selector : {@selector(draggingEntered:), @selector(draggingUpdated:)}) {
+        Method method = class_getInstanceMethod(vstWindowClass, selector);
+        if (!method) continue;
+        auto original = reinterpret_cast<NSDragOperation (*)(id, SEL, id<NSDraggingInfo>)>(
+            method_getImplementation(method));
+        IMP safeImp = imp_implementationWithBlock(^NSDragOperation(NSWindow* window, id<NSDraggingInfo> sender) {
+            if ([window respondsToSelector:@selector(isCustomWindowParented)] &&
+                [window isCustomWindowParented]) {
+                return original(window, selector, sender);
+            }
+            NSView* content = window.contentView;
+            return [content respondsToSelector:selector]
+                ? reinterpret_cast<NSDragOperation (*)(id, SEL, id<NSDraggingInfo>)>(
+                    [content methodForSelector:selector])(content, selector, sender)
+                : NSDragOperationNone;
+        });
+        method_setImplementation(method, safeImp);
+    }
+    for (SEL selector : {@selector(prepareForDragOperation:), @selector(performDragOperation:)}) {
+        Method method = class_getInstanceMethod(vstWindowClass, selector);
+        if (!method) continue;
+        auto original = reinterpret_cast<BOOL (*)(id, SEL, id<NSDraggingInfo>)>(
+            method_getImplementation(method));
+        IMP safeImp = imp_implementationWithBlock(^BOOL(NSWindow* window, id<NSDraggingInfo> sender) {
+            if ([window respondsToSelector:@selector(isCustomWindowParented)] &&
+                [window isCustomWindowParented]) {
+                return original(window, selector, sender);
+            }
+            NSView* content = window.contentView;
+            return [content respondsToSelector:selector] &&
+                reinterpret_cast<BOOL (*)(id, SEL, id<NSDraggingInfo>)>(
+                    [content methodForSelector:selector])(content, selector, sender);
+        });
+        method_setImplementation(method, safeImp);
+    }
+}
+
 static void synchronizeEditorWindow(NSView* parentView) {
     NSWindow* hostWindow = parentView.window;
     if (!hostWindow) return;
+
+    NSWindow* stagingWindow = objc_getAssociatedObject(parentView, &stagingWindowKey);
+    if (stagingWindow && hostWindow != stagingWindow) {
+        [stagingWindow close];
+        objc_setAssociatedObject(parentView, &stagingWindowKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+
+    NSHashTable<NSWindow*>* vstWindows = objc_getAssociatedObject(parentView, &vstWindowsKey);
+    for (NSWindow* vstWindow in vstWindows.allObjects) {
+        if (hostWindow != stagingWindow && vstWindow.parentWindow != hostWindow) {
+            if (vstWindow.parentWindow) [vstWindow.parentWindow removeChildWindow:vstWindow];
+            if ([vstWindow respondsToSelector:@selector(setParent:)]) [vstWindow setParent:hostWindow];
+            if ([vstWindow respondsToSelector:@selector(updateParent)]) [vstWindow updateParent];
+        }
+    }
 
     for (NSWindow* backingWindow in NSApp.windows) {
         if (backingWindow == hostWindow) continue;
@@ -215,11 +292,11 @@ static BOOL hostedPerformDrop(NSView* view, SEL selector, id<NSDraggingInfo> sen
         view, selector, sender);
 }
 
-static void installFileDropHandler(NSView* view, FLPluginInstance* owner, NSHashTable<NSView*>* views) {
+static void installFileDropHandler(NSView* view, FLPluginInstance* owner, NSHashTable<NSView*>* views, bool root = true) {
     for (NSView* child in view.subviews) {
-        if (child.registeredDraggedTypes.count) installFileDropHandler(child, owner, views);
+        installFileDropHandler(child, owner, views, false);
     }
-    if (objc_getAssociatedObject(view, &fileDropOwnerKey)) return;
+    if ((!root && !view.registeredDraggedTypes.count) || objc_getAssociatedObject(view, &fileDropOwnerKey)) return;
     Class original = object_getClass(view);
     NSString* name = [@"FLBridgeFileDrop_" stringByAppendingString:NSStringFromClass(original)];
     Class subclass = NSClassFromString(name);
@@ -1111,7 +1188,64 @@ bool FLPluginInstance::attachEditorToNSView(void* parentNSView, int& outWidth, i
     const bool macVclEditor = m_isPascalABI || m_pluginName == "DirectWave";
     intptr_t editorHandle = macVclEditor ? (((intptr_t)parentNSView) | 1) : (intptr_t)parentNSView;
     @autoreleasepool {
-        m_fnDispatcher(m_plug, FPD_ShowEditor, 0, editorHandle);
+        if (m_pluginName == "Newtone") {
+            installVstWindowSafeHandlers();
+            void* form = *(void**)((uint8_t*)m_plug + 0xc8);
+            void* mainPanel = form ? *(void**)((uint8_t*)form + 0x8e0) : nullptr;
+            if (!mainPanel) return false;
+            NSView* topRoot = parentView;
+            while (!topRoot.window && topRoot.superview) topRoot = topRoot.superview;
+            NSWindow* stagingWindow = nil;
+            if (!topRoot.window) {
+                const NSRect rect = topRoot.frame.size.width > 0 && topRoot.frame.size.height > 0
+                    ? NSMakeRect(-10000, -10000, topRoot.frame.size.width, topRoot.frame.size.height)
+                    : NSMakeRect(-10000, -10000, 900, 600);
+                stagingWindow = [[NSWindow alloc] initWithContentRect:rect
+                    styleMask:NSWindowStyleMaskBorderless backing:NSBackingStoreBuffered defer:NO];
+                stagingWindow.releasedWhenClosed = NO;
+                [stagingWindow.contentView addSubview:topRoot];
+                objc_setAssociatedObject(parentView, &stagingWindowKey, stagingWindow,
+                                         OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            }
+            auto setParentWindow = *(void (**)(void*, intptr_t))(*(uintptr_t*)mainPanel + 0x578);
+            setParentWindow(mainPanel, (intptr_t)parentNSView);
+            editorHandle = *(intptr_t*)((uint8_t*)mainPanel + 0x618);
+            if (!editorHandle) {
+                if (stagingWindow) {
+                    [topRoot removeFromSuperview];
+                    [stagingWindow close];
+                    objc_setAssociatedObject(parentView, &stagingWindowKey, nil,
+                                             OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+                }
+                return false;
+            }
+            synchronizeEditorWindow(parentView);
+            m_fnDispatcher(m_plug, FPD_ShowEditor, 0, editorHandle);
+            if (void* audioObj = *(void**)((uint8_t*)m_plug + 0x200)) {
+                auto getEngineCount = reinterpret_cast<int32_t (*)(void*)>(
+                    reinterpret_cast<uintptr_t>(m_fnDispatcher) - 0x679b0 + 0x6d690);
+                auto getEngine = reinterpret_cast<void* (*)(void*, int32_t)>(
+                    reinterpret_cast<uintptr_t>(m_fnDispatcher) - 0x679b0 + 0x6d6b0);
+                NSHashTable<NSWindow*>* vstWindows = [NSHashTable weakObjectsHashTable];
+                const int32_t count = getEngineCount(audioObj);
+                for (int32_t i = 0; i < count; ++i) {
+                    void* engine = getEngine(audioObj, i);
+                    NSView* content = engine ? (__bridge NSView*)(*(void**)((uint8_t*)engine + 0x50)) : nil;
+                    if (NSWindow* vstWindow = content.window) {
+                        [vstWindows addObject:vstWindow];
+                    }
+                }
+                objc_setAssociatedObject(parentView, &vstWindowsKey, vstWindows,
+                                         OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            }
+            if (stagingWindow) {
+                // Keep topRoot in stagingWindow until the DAW moves its parent NSView into the host NSWindow;
+                // [NSWindow.contentView addSubview:...] automatically reparents topRoot out of stagingWindow.
+                [stagingWindow orderOut:nil];
+            }
+        } else {
+            m_fnDispatcher(m_plug, FPD_ShowEditor, 0, editorHandle);
+        }
     }
     // MacVCL still inspects its previous host view while reparenting.
     if (previousParent) CFRelease(previousParent);
@@ -1127,10 +1261,15 @@ bool FLPluginInstance::attachEditorToNSView(void* parentNSView, int& outWidth, i
             outWidth = (int)std::lround(f.size.width);
             outHeight = (int)std::lround(f.size.height);
             [sv setFrameOrigin:NSMakePoint(0, 0)];
-            if (m_pluginName == "Harmor" || m_pluginName == "Fruity Scratcher" || m_pluginName == "3x Osc") {
+            if (m_pluginName == "Harmor" || m_pluginName == "Fruity Scratcher" ||
+                m_pluginName == "3x Osc" || m_pluginName == "Newtone") {
                 NSHashTable<NSView*>* views = [NSHashTable weakObjectsHashTable];
                 objc_setAssociatedObject(parentView, &fileDropViewsKey, views, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
                 installFileDropHandler(sv, this, views);
+                NSHashTable<NSWindow*>* vstWindows = objc_getAssociatedObject(parentView, &vstWindowsKey);
+                for (NSWindow* vstWindow in vstWindows.allObjects) {
+                    if (vstWindow.contentView) installFileDropHandler(vstWindow.contentView, this, views);
+                }
             }
             break;
         }
@@ -1215,7 +1354,33 @@ void FLPluginInstance::detachEditor() {
         }
     }
     @autoreleasepool {
+        if (m_pluginName == "Newtone" && m_parentNSView) {
+            NSView* parentView = (__bridge NSView*)m_parentNSView;
+            NSHashTable<NSWindow*>* vstWindows = objc_getAssociatedObject(parentView, &vstWindowsKey);
+            for (NSWindow* vstWindow in vstWindows.allObjects) {
+                if (vstWindow.parentWindow) [vstWindow.parentWindow removeChildWindow:vstWindow];
+                if ([vstWindow respondsToSelector:@selector(setParent:)]) [vstWindow setParent:nil];
+            }
+            objc_setAssociatedObject(parentView, &vstWindowsKey, nil,
+                                     OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        }
         m_fnDispatcher(m_plug, FPD_ShowEditor, 0, 0);
+        if (m_pluginName == "Newtone") {
+            void* form = *(void**)((uint8_t*)m_plug + 0xc8);
+            void* mainPanel = form ? *(void**)((uint8_t*)form + 0x8e0) : nullptr;
+            if (mainPanel) {
+                auto setParentWindow = *(void (**)(void*, intptr_t))(*(uintptr_t*)mainPanel + 0x578);
+                setParentWindow(mainPanel, 0);
+            }
+            if (m_parentNSView) {
+                NSView* parentView = (__bridge NSView*)m_parentNSView;
+                if (NSWindow* stagingWindow = objc_getAssociatedObject(parentView, &stagingWindowKey)) {
+                    [stagingWindow close];
+                    objc_setAssociatedObject(parentView, &stagingWindowKey, nil,
+                                             OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+                }
+            }
+        }
     }
     m_editorOpen = false;
 }

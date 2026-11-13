@@ -249,6 +249,10 @@ bool FLPluginInstance::loadDroppedFile(const std::string& path) {
     if (result == 0 && m_pluginName == "Harmor" &&
         (extension == ".png" || extension == ".jpg" || extension == ".jpeg" || extension == ".bmp"))
         return true;
+    if (result == 0 && m_pluginName == "Newtone" &&
+        (extension == ".wav" || extension == ".aif" || extension == ".aiff" || extension == ".mp3" ||
+         extension == ".flac" || extension == ".ogg" || extension == ".m4a" || extension == ".wv"))
+        return true;
     if (result == 0 && (m_pluginFlags & (FPF_GetChanCustomShape | FPF_GetChanSample))) {
         lock.unlock();
         return loadChannelSample(path);

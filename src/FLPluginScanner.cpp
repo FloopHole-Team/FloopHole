@@ -184,7 +184,7 @@ bool FLPluginScanner::isPluginExcluded(const std::string& name) {
         "Fruity X-Y Controller", "Fruity X-Y-Z Controller", "VFX Color Mapper", "VFX Envelope",
         "VFX Key Mapper", "VFX Keyboard Splitter", "VFX Level Scaler", "VFX Script", "VFX Sequencer",
         "Fruity Granulizer", "Fruity Slicer", "Wave Traveller",
-        "Edison", "Newtime", "Newtone"
+        "Edison", "Newtime"
     };
     return excluded.count(name) != 0;
 }

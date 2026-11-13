@@ -141,6 +141,10 @@ void FLPluginInstance::initializeChannelState() {
     m_transportValid = false;
     setEnabled(m_enabled);
     if (!m_plug || !m_fnProcessEvent) return;
+    const float tempo = static_cast<float>(m_tempoBPM);
+    int32_t tempoBits = 0;
+    memcpy(&tempoBits, &tempo, sizeof(tempoBits));
+    m_fnProcessEvent(m_plug, FPE_Tempo, tempoBits, static_cast<int32_t>(std::lround(m_tempoBPM)));
     m_fnProcessEvent(m_plug, FPE_MaxPoly, kMaxVoices, 0);
     // FLEX starts muted without this event; wrapper gain is applied after rendering.
     const float volume = 1.0f;
@@ -151,8 +155,15 @@ void FLPluginInstance::initializeChannelState() {
 
 void FLPluginInstance::updateTransport(double tempo, double quarters, bool playing, double seconds,
                                        int32_t numerator, int32_t denominator, int32_t frames) {
+    const double previousTempo = m_tempoBPM;
     if (std::isfinite(tempo) && tempo > 0) m_tempoBPM = tempo;
     else fprintf(stderr, "FloopHole: invalid transport tempo; retaining the previous tempo\n");
+    if ((!m_transportValid || m_tempoBPM != previousTempo) && m_fnProcessEvent) {
+        const float tempoFloat = static_cast<float>(m_tempoBPM);
+        int32_t tempoBits = 0;
+        memcpy(&tempoBits, &tempoFloat, sizeof(tempoBits));
+        m_fnProcessEvent(m_plug, FPE_Tempo, tempoBits, static_cast<int32_t>(std::lround(m_tempoBPM)));
+    }
     if (!std::isfinite(quarters)) {
         fprintf(stderr, "FloopHole: invalid musical position; using the predicted transport position\n");
         quarters = m_expectedNextPPQ;
