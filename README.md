@@ -87,19 +87,29 @@ ditto build/VST3/FloopHole.vst3 "$HOME/Library/Audio/Plug-Ins/VST3/FloopHole.vst
 ## Build on Windows
 
 Requirements: Git for Windows, CMake 3.20+, and Visual Studio 2022 (or Build Tools)
-with **Desktop development with C++**, the Windows SDK, and **C++ CMake tools for
-Windows** (including Ninja).
+with **Desktop development with C++** and the Windows SDK.
 
-Open an **x64 Native Tools Command Prompt for VS 2022**, change to the repository
-root, and run:
+Open PowerShell or Command Prompt, change to the repository root, and run:
 
 ```bat
 cmake -P scripts/init.cmake
-cmake -S . -B build-windows -G Ninja -DCMAKE_BUILD_TYPE=Release
-cmake --build build-windows --target FloopHole --parallel
+cmake -S . -B build-windows -G "Visual Studio 17 2022" -A x64 -DBUILD_TESTING=OFF
+cmake --build build-windows --config Release --target FloopHole --parallel
 ```
 
-Use the x64 tools, not x86 or ARM64.
+For subsequent Windows builds, only run:
+
+```bat
+cmake --build build-windows --config Release --target FloopHole --parallel
+```
+
+Windows cannot build this project's macOS target with the supplied toolchains.
+Use a Mac with Xcode Command Line Tools, or a macOS CI runner, and follow
+the macOS setup above. After that initial setup, repeat Mac builds with:
+
+```sh
+cmake --build build --target FloopHole --parallel
+```
 
 Outputs:
 

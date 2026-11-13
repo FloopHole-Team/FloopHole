@@ -168,6 +168,8 @@ if(APPLE)
         "-framework AudioToolbox"
     )
 elseif(WIN32)
+    add_compile_definitions(NOMINMAX)
+
     add_executable(FloopHole_probe
         src/test_win32.cpp
         ${FLBRIDGE_SHARED_SOURCES}
@@ -233,8 +235,8 @@ elseif(WIN32)
         PREFIX ""
         OUTPUT_NAME "FloopHole"
         SUFFIX ".vst3"
-        LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/VST3/FloopHole.vst3/Contents/x86_64-win"
-        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/VST3/FloopHole.vst3/Contents/x86_64-win"
+        LIBRARY_OUTPUT_DIRECTORY "$<1:${CMAKE_BINARY_DIR}/VST3/FloopHole.vst3/Contents/x86_64-win>"
+        RUNTIME_OUTPUT_DIRECTORY "$<1:${CMAKE_BINARY_DIR}/VST3/FloopHole.vst3/Contents/x86_64-win>"
     )
 
     add_custom_command(TARGET FloopHole POST_BUILD
@@ -250,7 +252,7 @@ target_include_directories(FloopHole PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/genera
 target_link_libraries(FloopHole PRIVATE lunasvg::lunasvg)
 set(FLOOPHOLE_RESOURCES "${CMAKE_BINARY_DIR}/VST3/FloopHole.vst3/Contents/Resources")
 set_property(TARGET FloopHole APPEND PROPERTY LINK_DEPENDS
-    "${CMAKE_CURRENT_SOURCE_DIR}/licence.md"
+    "${CMAKE_CURRENT_SOURCE_DIR}/LICENSE"
     "${lunasvg_SOURCE_DIR}/LICENSE"
     "${lunasvg_SOURCE_DIR}/plutovg/LICENSE"
     "${VST3_PLUGINTERFACES_DIR}/pluginterfaces/LICENSE.txt"
@@ -258,7 +260,7 @@ set_property(TARGET FloopHole APPEND PROPERTY LINK_DEPENDS
 )
 add_custom_command(TARGET FloopHole POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E make_directory "${FLOOPHOLE_RESOURCES}/licenses"
-    COMMAND ${CMAKE_COMMAND} -E copy_if_different "${CMAKE_CURRENT_SOURCE_DIR}/licence.md" "${FLOOPHOLE_RESOURCES}/licenses/FloopHole-MIT.txt"
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different "${CMAKE_CURRENT_SOURCE_DIR}/LICENSE" "${FLOOPHOLE_RESOURCES}/licenses/FloopHole-MIT.txt"
     COMMAND ${CMAKE_COMMAND} -E copy_if_different "${lunasvg_SOURCE_DIR}/LICENSE" "${FLOOPHOLE_RESOURCES}/licenses/LunaSVG-MIT.txt"
     COMMAND ${CMAKE_COMMAND} -E copy_if_different "${lunasvg_SOURCE_DIR}/plutovg/LICENSE" "${FLOOPHOLE_RESOURCES}/licenses/PlutoVG-MIT.txt"
     COMMAND ${CMAKE_COMMAND} -E copy_if_different "${VST3_PLUGINTERFACES_DIR}/pluginterfaces/LICENSE.txt" "${FLOOPHOLE_RESOURCES}/licenses/VST3-MIT.txt"
