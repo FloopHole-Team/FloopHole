@@ -93,6 +93,8 @@ struct FakePlugin {
     int releases = 0;
     int kills = 0;
     int maxPoly = 0;
+    int32_t tempoBits = 0;
+    int32_t tempoBPM = 0;
     int32_t channelVolume = 0;
     int internalPreset = -1;
     int internalPresetLoads = 0;
@@ -194,7 +196,10 @@ static intptr_t dispatch(void* self, intptr_t id, intptr_t index, intptr_t value
 
 static int32_t processEvent(void* self, int32_t id, int32_t value, int32_t flags) {
     auto& fake = *static_cast<FakePlugin*>(self);
-    if (id == FPE_MaxPoly) {
+    if (id == FPE_Tempo) {
+        fake.tempoBits = value;
+        fake.tempoBPM = flags;
+    } else if (id == FPE_MaxPoly) {
         CHECK(flags == 0);
         fake.maxPoly = value;
     } else {
@@ -733,6 +738,7 @@ static void testPluginCatalog() {
     CHECK(!FLPluginScanner::isPluginExcluded("Wave Candy"));
     CHECK(!FLPluginScanner::isPluginExcluded("DirectWave"));
     CHECK(!FLPluginScanner::isPluginExcluded("FL Keys"));
+    CHECK(!FLPluginScanner::isPluginExcluded("Newtone"));
     CHECK(FLPluginScanner::isPluginExcluded("Patcher"));
     FLPluginScannerTestAccess::setPlugins({});
     CHECK(scanner.getPluginIndices(true).empty());

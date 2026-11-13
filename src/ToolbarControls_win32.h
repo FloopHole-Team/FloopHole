@@ -30,6 +30,9 @@ public:
     void setPresets(const std::vector<FLPresetEntry>& presets, int selected);
     void setHint(const std::string& hint);
     void closeMenu();
+    HWND menuWindow() const { return m_menu; }
+    int firstVisibleRow() const { return m_first; }
+    int highlightedRow() const { return m_highlighted; }
 
 private:
     struct Control { WindowsToolbar* owner = nullptr; int index = 0; bool hover = false; bool pressed = false; };
@@ -41,6 +44,9 @@ private:
     void activate(int);
     void openMenu();
     void chooseRow(int);
+    void handleChar(wchar_t ch);
+    int findMatch(const std::wstring& queryLower) const;
+    void scrollToRow(int row);
     HWND m_parent = nullptr;
     HWND m_menu = nullptr;
     HINSTANCE m_module = nullptr;
@@ -48,13 +54,20 @@ private:
     std::array<HWND, 6> m_controls{};
     std::array<Control, 6> m_data{};
     std::vector<PresetMenuItem> m_items;
+    std::vector<std::wstring> m_wideItems;
+    std::vector<std::wstring> m_lowerItems;
     std::wstring m_title = L"Default / Internal Patch";
     std::wstring m_hint = L"Ready";
+    std::wstring m_searchQuery;
+    DWORD m_lastSearchTime = 0;
     int m_selected = -1;
     int m_highlighted = -1;
     int m_first = 0;
     int m_visible = 0;
     int m_wheelRemainder = 0;
+    bool m_thumbDragging = false;
+    bool m_thumbHovered = false;
+    float m_dragThumbOffsetY = 0.0f;
     LogoRaster m_logo;
 };
 

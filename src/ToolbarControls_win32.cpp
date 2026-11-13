@@ -87,10 +87,21 @@ bool WindowsToolbar::attach() {
 void WindowsToolbar::setPresets(const std::vector<FLPresetEntry>& presets, int selected) {
     closeMenu();
     m_items = presetMenuItems(presets);
+    m_wideItems.clear();
+    m_lowerItems.clear();
+    m_wideItems.reserve(m_items.size());
+    m_lowerItems.reserve(m_items.size());
+    for (const auto& item : m_items) {
+        std::wstring w = wide(item.text);
+        m_wideItems.push_back(w);
+        for (auto& c : w) c = towlower(c);
+        m_lowerItems.push_back(std::move(w));
+    }
     m_selected = -1;
     for (size_t i = 0; i < m_items.size(); ++i)
         if (m_items[i].preset == selected && selected >= 0) m_selected = static_cast<int>(i);
-    m_title = m_selected >= 0 ? wide(m_items[m_selected].text) : L"Default / Internal Patch";
+    m_title = (m_selected >= 0 && m_selected < static_cast<int>(m_wideItems.size())) ?
+        m_wideItems[m_selected] : L"Default / Internal Patch";
     SetWindowTextW(m_controls[1], m_title.c_str());
     InvalidateRect(m_controls[1], nullptr, FALSE);
 }
@@ -234,6 +245,10 @@ void WindowsToolbar::openMenu() {
         monitor.rcWork.top, monitor.rcWork.bottom - height);
     m_first = std::clamp(m_selected - m_visible / 2, 0, std::max(0, static_cast<int>(m_items.size()) - m_visible));
     m_highlighted = m_selected;
+    m_thumbDragging = false;
+    m_thumbHovered = false;
+    m_searchQuery.clear();
+    m_lastSearchTime = 0;
     m_menu = CreateWindowExW(WS_EX_TOOLWINDOW, L"FloopHolePresetMenu", L"Presets", WS_POPUP,
         x, y, width, height, GetAncestor(m_parent, GA_ROOT), nullptr, m_module, this);
     if (!m_menu) {
@@ -259,6 +274,10 @@ void WindowsToolbar::openMenu() {
 }
 
 void WindowsToolbar::closeMenu() {
+    m_thumbDragging = false;
+    m_thumbHovered = false;
+    m_searchQuery.clear();
+    m_lastSearchTime = 0;
     HWND menu = m_menu;
     m_menu = nullptr;
     if (!menu) return;
@@ -273,6 +292,90 @@ void WindowsToolbar::chooseRow(int row) {
     const int preset = m_items[row].preset;
     closeMenu();
     if (m_actions.preset) m_actions.preset(preset);
+}
+
+void WindowsToolbar::scrollToRow(int row) {
+    if (row < 0 || row >= static_cast<int>(m_items.size())) return;
+    m_highlighted = row;
+    if (row < m_first) m_first = row;
+    if (row >= m_first + m_visible) m_first = row - m_visible + 1;
+    InvalidateRect(m_menu, nullptr, FALSE);
+}
+
+int WindowsToolbar::findMatch(const std::wstring& queryLower) const {
+    if (queryLower.empty()) return -1;
+    for (size_t i = 0; i < m_items.size(); ++i) {
+        if (m_items[i].preset < 0 || i >= m_lowerItems.size()) continue;
+        const auto& textLower = m_lowerItems[i];
+        if (textLower.size() >= queryLower.size() &&
+            textLower.compare(0, queryLower.size(), queryLower) == 0) {
+            return static_cast<int>(i);
+        }
+    }
+    for (size_t i = 0; i < m_items.size(); ++i) {
+        if (m_items[i].preset < 0 || i >= m_lowerItems.size()) continue;
+        const auto& textLower = m_lowerItems[i];
+        if (textLower.find(queryLower) != std::wstring::npos) {
+            return static_cast<int>(i);
+        }
+    }
+    return -1;
+}
+
+void WindowsToolbar::handleChar(wchar_t ch) {
+    if (m_items.empty() || !m_menu) return;
+    const DWORD now = GetTickCount();
+
+    if (ch == VK_BACK || ch == 8) {
+        if (!m_searchQuery.empty()) {
+            m_searchQuery.pop_back();
+            m_lastSearchTime = now;
+            if (m_searchQuery.empty()) return;
+            std::wstring queryLower = m_searchQuery;
+            for (auto& c : queryLower) c = towlower(c);
+            const int matchRow = findMatch(queryLower);
+            if (matchRow >= 0) scrollToRow(matchRow);
+        }
+        return;
+    }
+
+    if (ch < 32) return;
+    if (ch == L' ' && m_searchQuery.empty()) return;
+
+    const bool repeatSingle = (m_searchQuery.size() == 1 &&
+        towlower(m_searchQuery[0]) == towlower(ch) &&
+        (now - m_lastSearchTime) <= 1000);
+
+    if (repeatSingle) {
+        m_lastSearchTime = now;
+        const int total = static_cast<int>(m_items.size());
+        const int start = (m_highlighted >= 0 ? m_highlighted + 1 : 0);
+        for (int offset = 0; offset < total; ++offset) {
+            const int row = (start + offset) % total;
+            if (m_items[row].preset >= 0 && row < static_cast<int>(m_lowerItems.size())) {
+                const auto& textLower = m_lowerItems[row];
+                if (!textLower.empty() && textLower[0] == towlower(ch)) {
+                    scrollToRow(row);
+                    return;
+                }
+            }
+        }
+        return;
+    }
+
+    std::wstring testQuery = (now - m_lastSearchTime > 1000) ? std::wstring(1, ch) : (m_searchQuery + ch);
+    std::wstring queryLower = testQuery;
+    for (auto& c : queryLower) c = towlower(c);
+
+    const int matchRow = findMatch(queryLower);
+    if (matchRow >= 0) {
+        m_searchQuery = std::move(testQuery);
+        m_lastSearchTime = now;
+        scrollToRow(matchRow);
+    } else if (now - m_lastSearchTime > 1000) {
+        m_searchQuery.clear();
+        m_lastSearchTime = now;
+    }
 }
 
 void WindowsToolbar::paintMenu() {
@@ -290,14 +393,17 @@ void WindowsToolbar::paintMenu() {
                 ToolbarTheme::menuRowHeight);
             if (row == m_highlighted && m_items[row].preset >= 0) graphics.FillRectangle(&highlight, bounds);
             bounds.X += 9; bounds.Width -= 18;
-            text(graphics, wide(m_items[row].text), bounds, m_items[row].preset >= 0 ? ToolbarTheme::text : ToolbarTheme::muted);
+            const auto& rowText = (row >= 0 && row < static_cast<int>(m_wideItems.size())) ?
+                m_wideItems[row] : wide(m_items[row].text);
+            text(graphics, rowText, bounds, m_items[row].preset >= 0 ? ToolbarTheme::text : ToolbarTheme::muted);
         }
         if (static_cast<int>(m_items.size()) > m_visible) {
             const float available = rect.bottom - 8.0f;
             const float height = std::max(18.0f, available * m_visible / m_items.size());
             const float top = 4 + (available - height) * m_first / (m_items.size() - m_visible);
-            Gdiplus::SolidBrush thumb(color(ToolbarTheme::muted));
-            graphics.FillRectangle(&thumb, rect.right - 5.0f, top, 3.0f, height);
+            const bool thumbActive = m_thumbDragging || m_thumbHovered;
+            Gdiplus::SolidBrush thumb(color(thumbActive ? ToolbarTheme::text : ToolbarTheme::muted));
+            graphics.FillRectangle(&thumb, rect.right - (thumbActive ? 6.0f : 5.0f), top, thumbActive ? 4.0f : 3.0f, height);
         }
         Gdiplus::Pen border(color(ToolbarTheme::border), 1);
         graphics.DrawRectangle(&border, 0, 0, rect.right - 1, rect.bottom - 1);
@@ -320,30 +426,107 @@ LRESULT CALLBACK WindowsToolbar::menuProc(HWND window, UINT message, WPARAM wp, 
         case WM_KILLFOCUS: self->closeMenu(); return 0;
         case WM_CANCELMODE: self->closeMenu(); return 0;
         case WM_CAPTURECHANGED:
+            self->m_thumbDragging = false;
             if (self->m_menu && reinterpret_cast<HWND>(lp) != window) self->closeMenu();
             return 0;
+        case WM_GETDLGCODE:
+            return DLGC_WANTARROWS | DLGC_WANTCHARS;
         case WM_LBUTTONDOWN: {
             RECT rect{}; GetClientRect(window, &rect);
             POINT point{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
-            if (!PtInRect(&rect, point)) self->closeMenu();
+            if (!PtInRect(&rect, point)) {
+                self->closeMenu();
+                return 0;
+            }
+            const int total = static_cast<int>(self->m_items.size());
+            const bool hasScrollbar = total > self->m_visible;
+            constexpr int kScrollbarWidth = 14;
+            if (hasScrollbar && point.x >= rect.right - kScrollbarWidth) {
+                const float available = rect.bottom - 8.0f;
+                const float thumbHeight = std::max(18.0f, available * self->m_visible / total);
+                const int maxFirst = total - self->m_visible;
+                const float thumbTop = 4.0f + (available - thumbHeight) * self->m_first / maxFirst;
+
+                if (point.y >= thumbTop && point.y <= thumbTop + thumbHeight) {
+                    self->m_thumbDragging = true;
+                    self->m_dragThumbOffsetY = point.y - thumbTop;
+                } else {
+                    const float newTop = std::clamp(point.y - thumbHeight / 2.0f, 4.0f, 4.0f + available - thumbHeight);
+                    const float fraction = (available > thumbHeight) ? (newTop - 4.0f) / (available - thumbHeight) : 0.0f;
+                    self->m_first = std::clamp(static_cast<int>(std::round(fraction * maxFirst)), 0, maxFirst);
+                    self->m_thumbDragging = true;
+                    self->m_dragThumbOffsetY = thumbHeight / 2.0f;
+                    InvalidateRect(window, nullptr, FALSE);
+                }
+                return 0;
+            }
             return 0;
         }
         case WM_LBUTTONUP: {
+            if (self->m_thumbDragging) {
+                self->m_thumbDragging = false;
+                InvalidateRect(window, nullptr, FALSE);
+                return 0;
+            }
             RECT rect{}; GetClientRect(window, &rect);
             POINT point{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
-            if (PtInRect(&rect, point)) self->chooseRow(self->m_first + (point.y - 1) / ToolbarTheme::menuRowHeight);
-            else self->closeMenu();
+            const int total = static_cast<int>(self->m_items.size());
+            const bool hasScrollbar = total > self->m_visible;
+            constexpr int kScrollbarWidth = 14;
+            if (PtInRect(&rect, point)) {
+                if (hasScrollbar && point.x >= rect.right - kScrollbarWidth) return 0;
+                self->chooseRow(self->m_first + (point.y - 1) / ToolbarTheme::menuRowHeight);
+            } else {
+                self->closeMenu();
+            }
             return 0;
         }
         case WM_MOUSEMOVE: {
             RECT rect{}; GetClientRect(window, &rect);
             POINT point{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
-            self->m_highlighted = PtInRect(&rect, point) ?
-                self->m_first + (point.y - 1) / ToolbarTheme::menuRowHeight : -1;
-            InvalidateRect(window, nullptr, FALSE);
+            const int total = static_cast<int>(self->m_items.size());
+            const bool hasScrollbar = total > self->m_visible;
+            constexpr int kScrollbarWidth = 14;
+
+            if (self->m_thumbDragging && hasScrollbar) {
+                const float available = rect.bottom - 8.0f;
+                const float thumbHeight = std::max(18.0f, available * self->m_visible / total);
+                const int maxFirst = total - self->m_visible;
+                if (available > thumbHeight && maxFirst > 0) {
+                    const float newTop = std::clamp(point.y - self->m_dragThumbOffsetY, 4.0f, 4.0f + available - thumbHeight);
+                    const float fraction = (newTop - 4.0f) / (available - thumbHeight);
+                    const int newFirst = std::clamp(static_cast<int>(std::round(fraction * maxFirst)), 0, maxFirst);
+                    if (newFirst != self->m_first) {
+                        self->m_first = newFirst;
+                        InvalidateRect(window, nullptr, FALSE);
+                    }
+                }
+                return 0;
+            }
+
+            const bool overScrollbar = hasScrollbar && PtInRect(&rect, point) && point.x >= rect.right - kScrollbarWidth;
+            if (self->m_thumbHovered != overScrollbar) {
+                self->m_thumbHovered = overScrollbar;
+                InvalidateRect(window, nullptr, FALSE);
+            }
+
+            if (PtInRect(&rect, point) && !overScrollbar) {
+                const int newHighlight = self->m_first + (point.y - 1) / ToolbarTheme::menuRowHeight;
+                if (newHighlight != self->m_highlighted) {
+                    self->m_highlighted = newHighlight;
+                    self->m_searchQuery.clear();
+                    self->m_lastSearchTime = 0;
+                    InvalidateRect(window, nullptr, FALSE);
+                }
+            } else if (self->m_highlighted != -1) {
+                self->m_highlighted = -1;
+                InvalidateRect(window, nullptr, FALSE);
+            }
             return 0;
         }
         case WM_MOUSEWHEEL: {
+            self->m_searchQuery.clear();
+            self->m_lastSearchTime = 0;
             self->m_wheelRemainder += GET_WHEEL_DELTA_WPARAM(wp);
             const int steps = self->m_wheelRemainder / WHEEL_DELTA;
             self->m_wheelRemainder -= steps * WHEEL_DELTA;
@@ -352,19 +535,63 @@ LRESULT CALLBACK WindowsToolbar::menuProc(HWND window, UINT message, WPARAM wp, 
             InvalidateRect(window, nullptr, FALSE);
             return 0;
         }
+        case WM_CHAR:
+            self->handleChar(static_cast<wchar_t>(wp));
+            return 0;
         case WM_KEYDOWN:
             if (wp == VK_ESCAPE) { self->closeMenu(); return 0; }
             if (wp == VK_RETURN) { self->chooseRow(self->m_highlighted); return 0; }
             if (wp == VK_UP || wp == VK_DOWN) {
+                self->m_searchQuery.clear();
+                self->m_lastSearchTime = 0;
                 const int direction = wp == VK_DOWN ? 1 : -1;
                 int row = self->m_highlighted;
                 do { row += direction; }
                 while (row >= 0 && row < static_cast<int>(self->m_items.size()) && self->m_items[row].preset < 0);
                 if (row >= 0 && row < static_cast<int>(self->m_items.size())) {
-                    self->m_highlighted = row;
-                    if (row < self->m_first) self->m_first = row;
-                    if (row >= self->m_first + self->m_visible) self->m_first = row - self->m_visible + 1;
-                    InvalidateRect(window, nullptr, FALSE);
+                    self->scrollToRow(row);
+                }
+                return 0;
+            }
+            if (wp == VK_HOME) {
+                self->m_searchQuery.clear();
+                self->m_lastSearchTime = 0;
+                for (int row = 0; row < static_cast<int>(self->m_items.size()); ++row) {
+                    if (self->m_items[row].preset >= 0) {
+                        self->scrollToRow(row);
+                        break;
+                    }
+                }
+                return 0;
+            }
+            if (wp == VK_END) {
+                self->m_searchQuery.clear();
+                self->m_lastSearchTime = 0;
+                for (int row = static_cast<int>(self->m_items.size()) - 1; row >= 0; --row) {
+                    if (self->m_items[row].preset >= 0) {
+                        self->scrollToRow(row);
+                        break;
+                    }
+                }
+                return 0;
+            }
+            if (wp == VK_PRIOR) {
+                self->m_searchQuery.clear();
+                self->m_lastSearchTime = 0;
+                int target = std::max(0, self->m_highlighted - self->m_visible);
+                while (target > 0 && self->m_items[target].preset < 0) --target;
+                if (target < static_cast<int>(self->m_items.size()) && self->m_items[target].preset >= 0) {
+                    self->scrollToRow(target);
+                }
+                return 0;
+            }
+            if (wp == VK_NEXT) {
+                self->m_searchQuery.clear();
+                self->m_lastSearchTime = 0;
+                int target = std::min(static_cast<int>(self->m_items.size()) - 1, self->m_highlighted + self->m_visible);
+                while (target < static_cast<int>(self->m_items.size()) - 1 && self->m_items[target].preset < 0) ++target;
+                if (target >= 0 && self->m_items[target].preset >= 0) {
+                    self->scrollToRow(target);
                 }
                 return 0;
             }

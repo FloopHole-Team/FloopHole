@@ -36,6 +36,14 @@
 @implementation FLBridgeTestFileDrag
 @end
 
+// Matches Ableton Live's OPluginCocoaWindowDelegate, which does not implement
+// optional windowDidBecomeKey: or windowDidResignKey: selectors.
+@interface FLBridgeTestMinimalWindowDelegate : NSObject <NSWindowDelegate>
+@end
+@implementation FLBridgeTestMinimalWindowDelegate
+- (BOOL)windowShouldClose:(NSWindow*)sender { return YES; }
+@end
+
 static NSString* testPreferencesDomain = nil;
 @interface NSUserDefaults (FLBridgeTestPreferences)
 - (instancetype)initFLBridgeTestWithSuiteName:(NSString*)suite;
@@ -583,7 +591,7 @@ static void clickNativeEditor(flbr::FLPluginInstance* instance, NSWindow* window
 }
 
 static void verifyNativeEditorReopening() {
-    for (const char* name : {"Harmor", "3x Osc", "Fruity Scratcher", "Maximus", "Fruity Limiter"}) {
+    for (const char* name : {"Harmor", "3x Osc", "Fruity Scratcher", "Maximus", "Fruity Limiter", "Newtone"}) {
         flbr::FLPluginInstance instance;
         CHECK(instance.loadPluginByName(name));
         const double original = instance.getParamNormalized(0);
@@ -1037,7 +1045,8 @@ static void verifyVSTEditorResizing(const char* screenshotDirectory) {
         {"Fruity Mute 2", 1, false, 335, 55, 335, 55, 335, 55},
         {"Fruity Phase Inverter", 1, false, 170, 55, 170, 55, 170, 55},
         {"Fruity dB meter", 1, true, 100, 270, 100, 270, 32768, 32768},
-        {"LuxeVerb", 1, true, 940, 450, 940, 225, 940, 450}};
+        {"LuxeVerb", 1, true, 940, 450, 940, 225, 940, 450},
+        {"Newtone", 1, true, 728, 582, 657, 296, 32768, 32768}};
     for (const auto& test : cases) {
         PClassInfo info{};
         info = nativeClassInfo(factory, test.name);
@@ -1697,6 +1706,68 @@ static void verifyVSTEditorReopening() {
     controller->release();
     component->terminate();
     component->release();
+
+    // Verify Ableton Live's OPluginCocoaWindow + OPluginCocoaWindowDelegate sequence
+    // (where the host NSWindow delegate does not implement windowDidBecomeKey:/windowDidResignKey:)
+    // as well as deferred NSView window attachment.
+    [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
+    [NSApp activateIgnoringOtherApps:YES];
+    info = nativeClassInfo(factory, "Newtone");
+    CHECK(factory->createInstance(info.cid, IComponent::iid, reinterpret_cast<void**>(&component)) == kResultOk);
+    CHECK(component && component->initialize(nullptr) == kResultOk);
+    CHECK(component->queryInterface(IEditController::iid, reinterpret_cast<void**>(&controller)) == kResultOk);
+    for (int cycle = 0; cycle < 3; ++cycle) {
+        @autoreleasepool {
+            view = controller->createView(ViewType::kEditor);
+            CHECK(view && view->setFrame(&frame) == kResultOk);
+            FLBridgeTestMinimalWindowDelegate* delegate = [FLBridgeTestMinimalWindowDelegate new];
+            CHECK(![delegate respondsToSelector:@selector(windowDidBecomeKey:)]);
+            CHECK(![delegate respondsToSelector:@selector(windowDidResignKey:)]);
+            NSWindow* window = [[NSWindow alloc] initWithContentRect:NSMakeRect(120, 120, 900, 700)
+                styleMask:NSWindowStyleMaskTitled backing:NSBackingStoreBuffered defer:NO];
+            window.releasedWhenClosed = NO;
+            window.delegate = delegate;
+            [window makeKeyAndOrderFront:nil];
+            [NSApp activateIgnoringOtherApps:YES];
+            NSView* hostView = nil;
+            if (cycle == 0) {
+                // Ableton Live attaches directly to [OPluginCocoaWindow contentView] while it is key.
+                hostView = window.contentView;
+                CHECK(view->attached((__bridge void*)hostView, kPlatformTypeNSView) == kResultOk);
+            } else {
+                // Also verify deferred attachment where hostView is added to window after attached().
+                hostView = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, 900, 700)];
+                CHECK(hostView.window == nil);
+                CHECK(view->attached((__bridge void*)hostView, kPlatformTypeNSView) == kResultOk);
+                [window.contentView addSubview:hostView];
+            }
+            [NSRunLoop.currentRunLoop runUntilDate:[NSDate dateWithTimeIntervalSinceNow:0.05]];
+            NSView* editor = findNativeEditor(hostView);
+            CHECK(editor != nil && editor.window == window && !editor.hiddenOrHasHiddenAncestor);
+            NSWindow* vstWindow = nil;
+            for (NSWindow* candidate in NSApp.windows) {
+                if ([NSStringFromClass(object_getClass(candidate)) isEqualToString:@"VstWindow"] &&
+                    candidate.parentWindow == window) {
+                    vstWindow = candidate;
+                    break;
+                }
+            }
+            CHECK(vstWindow != nil && vstWindow.contentView != nil);
+            // Explicitly trigger VstWindow's key-window delegate notifications against the minimal host delegate.
+            [(id<NSWindowDelegate>)vstWindow.delegate windowDidBecomeKey:
+                [NSNotification notificationWithName:NSWindowDidBecomeKeyNotification object:vstWindow]];
+            [(id<NSWindowDelegate>)vstWindow.delegate windowDidResignKey:
+                [NSNotification notificationWithName:NSWindowDidResignKeyNotification object:vstWindow]];
+            CHECK(view->removed() == kResultOk);
+            view->release();
+            if (hostView != window.contentView) [hostView removeFromSuperview];
+            window.delegate = nil;
+            [window close];
+        }
+    }
+    controller->release();
+    component->terminate();
+    component->release();
     factory->release();
     CHECK(bundleExit());
     dlclose(bundle);
@@ -1787,7 +1858,7 @@ static void verifyChannelSampleState(const char* samplePath) {
 }
 
 static void verifyEditorCoordinates() {
-    for (const char* name : {"BooBass", "Sakura", "Sawer", "Harmor"}) {
+    for (const char* name : {"BooBass", "Sakura", "Sawer", "Harmor", "Newtone"}) {
         flbr::FLPluginInstance instance;
         CHECK(instance.loadPluginByName(name));
         auto getProp = reinterpret_cast<void (*)(void*, int, int, void*, int)>(dlsym(RTLD_DEFAULT, "MVObjectGetProp"));
@@ -2288,16 +2359,23 @@ int main(int argc, char** argv) {
                 fprintf(stderr, "Harmor IMG mouse input after drop passed\n");
                 instance.onParamChangedFromPlug = nullptr;
             }
-            if (strcmp(argv[2], "Harmor") == 0 && argc > 5 && strcmp(argv[5], "drop") == 0)
+            if ((strcmp(argv[2], "Harmor") == 0 || strcmp(argv[2], "Newtone") == 0) &&
+                argc > 5 && strcmp(argv[5], "drop") == 0)
                 CHECK(after.size() > before.size());
             const bool scratcher = strcmp(argv[2], "Fruity Scratcher") == 0 && argc > 3 && strcmp(argv[3], "-") != 0;
+            const bool newtone = strcmp(argv[2], "Newtone") == 0 && argc > 3 && strcmp(argv[3], "-") != 0;
             if (scratcher) clickNativeEditor(&instance, window, nativeEditor, NSMakePoint(176, 184));
+            if (newtone) {
+                [window makeKeyAndOrderFront:nil];
+                [NSApp activateIgnoringOtherApps:YES];
+                clickNativeEditor(&instance, window, nativeEditor, NSMakePoint(24, 30));
+            }
             instance.noteOn(0, 60, 0.8f);
             float input[256], left[256], right[256];
             float peak = 0;
             for (int block = 0; block < 300; ++block) {
                 for (int i = 0; i < 256; ++i)
-                    input[i] = scratcher ? 0 : (0.1f + 0.4f * (block % 100) / 100) *
+                    input[i] = (scratcher || newtone) ? 0 : (0.1f + 0.4f * (block % 100) / 100) *
                         std::sin((block * 256 + i) * 440.0 * 2 * M_PI / 44100);
                 instance.processAudio(input, input, left, right, 256, 120, 0, false);
                 for (int i = 0; i < 256; ++i) {
@@ -2308,9 +2386,9 @@ int main(int argc, char** argv) {
                 [NSRunLoop.currentRunLoop runUntilDate:[NSDate dateWithTimeIntervalSinceNow:0.006]];
             }
             fprintf(stderr, "Services audio peak: %.6f\n", peak);
-            if (scratcher) CHECK(peak > 0.01f);
+            if (scratcher || newtone) CHECK(peak > 0.01f);
             flbr::FLPluginInstanceTestAccess::reportServices(instance);
-            if (argc > 4) {
+            if (argc > 4 && strcmp(argv[4], "-") != 0) {
                 NSTask* capture = [NSTask new];
                 capture.executableURL = [NSURL fileURLWithPath:@"/usr/sbin/screencapture"];
                 capture.arguments = @[@"-x", @"-o", @"-l", [NSString stringWithFormat:@"%ld", (long)window.windowNumber],
@@ -2320,7 +2398,7 @@ int main(int argc, char** argv) {
                 [capture waitUntilExit];
                 CHECK(capture.terminationStatus == 0);
             }
-            if (scratcher) CHECK(instance.savePluginState(after));
+            if (scratcher || newtone) CHECK(instance.savePluginState(after));
             instance.detachEditor();
             CHECK(![NSStringFromClass(object_getClass(nativeEditor)) hasPrefix:@"FLBridgeFileDrop_"]);
             [window orderOut:nil];
@@ -2335,15 +2413,47 @@ int main(int argc, char** argv) {
                 restored.unloadPlugin();
                 fprintf(stderr, "Scratcher fresh-instance sample-state reload passed\n");
             }
+            if (newtone) {
+                flbr::FLPluginInstance restored;
+                CHECK(restored.loadPluginByName(argv[2]));
+                restored.setBlockSize(256);
+                CHECK(restored.restorePluginState(after.data(), after.size()));
+                CHECK(restored.attachEditorToNSView((__bridge void*)window.contentView, width, height));
+                [window setContentSize:NSMakeSize(width, height)];
+                [window makeKeyAndOrderFront:nil];
+                [NSApp activateIgnoringOtherApps:YES];
+                NSView* restoredEditor = window.contentView.subviews.firstObject;
+                CHECK(restoredEditor != nil);
+                clickNativeEditor(&restored, window, restoredEditor, NSMakePoint(24, 30));
+                float restoredPeak = 0;
+                memset(input, 0, sizeof(input));
+                for (int block = 0; block < 64; ++block) {
+                    restored.processAudio(input, input, left, right, 256, 120, 0, false);
+                    for (int i = 0; i < 256; ++i) {
+                        CHECK(std::isfinite(left[i]) && std::isfinite(right[i]));
+                        restoredPeak = std::max({restoredPeak, std::abs(left[i]), std::abs(right[i])});
+                    }
+                    restored.idleEditor();
+                }
+                CHECK(restoredPeak > 0.01f);
+                restored.detachEditor();
+                [window orderOut:nil];
+                restored.unloadPlugin();
+                fprintf(stderr, "Newtone fresh-instance sample-state reload and playback passed (peak %.6f)\n",
+                        restoredPeak);
+            }
             fprintf(stderr, "Services completed\n");
             return 0;
         }
-        if (argc > 1 && (strcmp(argv[1], "--probe-plugin") == 0 || strcmp(argv[1], "--catalog-plugin") == 0)) {
+        if (argc > 1 && (strcmp(argv[1], "--probe-plugin") == 0 ||
+                         strcmp(argv[1], "--probe-plugin-headless") == 0 ||
+                         strcmp(argv[1], "--catalog-plugin") == 0)) {
             CHECK(argc >= 4 && (strcmp(argv[2], "Generator") == 0 || strcmp(argv[2], "Effect") == 0));
             auto& scanner = flbr::FLPluginScanner::getInstance();
             CHECK(scanner.initialize());
+            const bool headless = strcmp(argv[1], "--probe-plugin-headless") == 0;
             const bool generator = strcmp(argv[2], "Generator") == 0;
-            const int index = strcmp(argv[1], "--probe-plugin") == 0 ?
+            const int index = strcmp(argv[1], "--catalog-plugin") != 0 ?
                 flbr::FLPluginScannerTestAccess::includeForProbe(argv[3], generator) :
                 scanner.findPluginIndexByName(argv[3], generator);
             CHECK(index >= 0);
@@ -2380,19 +2490,25 @@ int main(int argc, char** argv) {
                 return peak;
             };
             if (std::getenv("FLBR_TRACE_HOST")) renderProbe("before editor");
-            NSWindow* window = [[NSWindow alloc] initWithContentRect:NSMakeRect(0, 0, 1200, 900)
-                styleMask:NSWindowStyleMaskTitled backing:NSBackingStoreBuffered defer:NO];
-            window.releasedWhenClosed = NO;
+            NSWindow* window = nil;
             int width = 0, height = 0;
-            CHECK(instance.attachEditorToNSView((__bridge void*)window.contentView, width, height));
-            fprintf(stderr, "Probe editor attached %d x %d\n", width, height);
-            for (int i = 0; i < 10; ++i) {
-                instance.idleEditor();
-                [NSRunLoop.currentRunLoop runUntilDate:[NSDate dateWithTimeIntervalSinceNow:0.005]];
+            if (!headless) {
+                window = [[NSWindow alloc] initWithContentRect:NSMakeRect(0, 0, 1200, 900)
+                    styleMask:NSWindowStyleMaskTitled backing:NSBackingStoreBuffered defer:NO];
+                window.releasedWhenClosed = NO;
+                CHECK(instance.attachEditorToNSView((__bridge void*)window.contentView, width, height));
+                fprintf(stderr, "Probe editor attached %d x %d\n", width, height);
+                for (int i = 0; i < 10; ++i) {
+                    instance.idleEditor();
+                    [NSRunLoop.currentRunLoop runUntilDate:[NSDate dateWithTimeIntervalSinceNow:0.005]];
+                }
+            } else {
+                fprintf(stderr, "Probe editor skipped; editor compatibility is not verified\n");
             }
             if (argc > 4 && strcmp(argv[4], "-") != 0)
                 flbr::FLPluginInstanceTestAccess::loadFile(instance, argv[4], argc > 6 ? atoi(argv[6]) : 0);
-            const bool sampler = strcmp(argv[3], "DirectWave") == 0 || strcmp(argv[3], "FL Keys") == 0;
+            const bool sampler = !headless &&
+                (strcmp(argv[3], "DirectWave") == 0 || strcmp(argv[3], "FL Keys") == 0);
             if (sampler || std::getenv("FLBR_TRACE_HOST")) {
                 const float initialPeak = renderProbe("before restore");
                 if (argc > 5) CHECK(initialPeak > strtod(argv[5], nullptr));

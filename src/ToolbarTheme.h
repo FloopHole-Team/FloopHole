@@ -32,7 +32,8 @@ inline std::vector<PresetMenuItem> presetMenuItems(const std::vector<FLPresetEnt
             category = presets[i].category;
             result.push_back({category, -1});
         }
-        result.push_back({presets[i].displayName, static_cast<int>(i)});
+        const auto& name = presets[i].name.empty() ? presets[i].displayName : presets[i].name;
+        result.push_back({name, static_cast<int>(i)});
     }
     if (result.empty()) result.push_back({"Default / Internal Patch", -1});
     return result;

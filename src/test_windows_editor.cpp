@@ -101,9 +101,155 @@ static void testGripColors() {
     CHECK(DeleteDC(dc));
 }
 
+static void testPresetMenuItems() {
+    std::vector<FLPresetEntry> presets;
+    FLPresetEntry p1;
+    p1.category = "Basses";
+    p1.name = "Sub";
+    p1.displayName = "Basses / Sub";
+    presets.push_back(p1);
+
+    FLPresetEntry p2;
+    p2.category = "Basses";
+    p2.name = "Reese";
+    p2.displayName = "Basses / Reese";
+    presets.push_back(p2);
+
+    FLPresetEntry p3;
+    p3.category = "Pads";
+    p3.name = "Warm Pad";
+    p3.displayName = "Pads / Warm Pad";
+    presets.push_back(p3);
+
+    FLPresetEntry p4;
+    p4.category = "";
+    p4.name = "Init";
+    p4.displayName = "Init";
+    presets.push_back(p4);
+
+    const auto items = presetMenuItems(presets);
+    CHECK(items.size() == 6);
+    CHECK(items[0].text == "Basses" && items[0].preset == -1);
+    CHECK(items[1].text == "Sub" && items[1].preset == 0);
+    CHECK(items[2].text == "Reese" && items[2].preset == 1);
+    CHECK(items[3].text == "Pads" && items[3].preset == -1);
+    CHECK(items[4].text == "Warm Pad" && items[4].preset == 2);
+    CHECK(items[5].text == "Init" && items[5].preset == 3);
+}
+
+static void testPresetMenuInteractions() {
+    GraphicsSession session;
+    HWND parent = CreateWindowExW(0, L"STATIC", L"FloopHole interaction test", WS_POPUP,
+        0, 0, 640, 100, nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
+    CHECK(parent);
+
+    int activatedPreset = -1;
+    WindowsToolbar::Actions actions{};
+    actions.preset = [&](int p) { activatedPreset = p; };
+
+    auto toolbar = std::make_unique<WindowsToolbar>(parent, actions);
+    CHECK(toolbar->attach());
+
+    std::vector<FLPresetEntry> presets;
+    for (int i = 0; i < 40; ++i) {
+        FLPresetEntry p;
+        p.category = (i < 20) ? "Arps" : "Basses";
+        p.name = (i % 2 == 0) ? ("Alpha " + std::to_string(i)) : ("Beta " + std::to_string(i));
+        p.displayName = p.category + " / " + p.name;
+        presets.push_back(p);
+    }
+    toolbar->setPresets(presets, 0);
+
+    wchar_t titleBuf[64] = {0};
+    GetWindowTextW(toolbar->controls()[1], titleBuf, 64);
+    CHECK(std::wstring(titleBuf) == L"Alpha 0");
+
+    SendMessageW(toolbar->controls()[1], WM_KEYDOWN, VK_DOWN, 0);
+    HWND menu = toolbar->menuWindow();
+    CHECK(menu && IsWindow(menu));
+
+    SendMessageW(menu, WM_CHAR, L'b', 0);
+    SendMessageW(menu, WM_KEYDOWN, VK_RETURN, 0);
+    CHECK(!toolbar->menuWindow());
+    CHECK(activatedPreset == 1);
+
+    SendMessageW(toolbar->controls()[1], WM_KEYDOWN, VK_DOWN, 0);
+    menu = toolbar->menuWindow();
+    CHECK(menu && IsWindow(menu));
+
+    SendMessageW(menu, WM_CHAR, L'a', 0);
+    SendMessageW(menu, WM_CHAR, L'l', 0);
+    SendMessageW(menu, WM_KEYDOWN, VK_RETURN, 0);
+    CHECK(!toolbar->menuWindow());
+    CHECK(activatedPreset == 0);
+
+    // Repeated single-character typing cycles through matching presets
+    SendMessageW(toolbar->controls()[1], WM_KEYDOWN, VK_DOWN, 0);
+    menu = toolbar->menuWindow();
+    CHECK(menu && IsWindow(menu));
+    SendMessageW(menu, WM_CHAR, L'a', 0);
+    CHECK(toolbar->highlightedRow() == 1); // "Alpha 0"
+    SendMessageW(menu, WM_CHAR, L'a', 0);
+    CHECK(toolbar->highlightedRow() == 3); // "Alpha 2"
+    SendMessageW(menu, WM_CHAR, L'a', 0);
+    CHECK(toolbar->highlightedRow() == 5); // "Alpha 4"
+
+    // Backspace test: clear query with backspace, then search 'b'
+    SendMessageW(menu, WM_CHAR, VK_BACK, 0);
+    SendMessageW(menu, WM_CHAR, L'b', 0);
+    CHECK(toolbar->highlightedRow() == 2); // "Beta 1"
+
+    // Sleep test: after 1050ms timeout, typing starts a fresh search
+    Sleep(1050);
+    SendMessageW(menu, WM_CHAR, L'a', 0);
+    CHECK(toolbar->highlightedRow() == 1); // "Alpha 0"
+
+    // Navigation keys test (Home / End)
+    SendMessageW(menu, WM_KEYDOWN, VK_END, 0);
+    CHECK(toolbar->highlightedRow() > 30);
+    SendMessageW(menu, WM_KEYDOWN, VK_HOME, 0);
+    CHECK(toolbar->highlightedRow() == 1); // first enabled preset
+
+    toolbar->closeMenu();
+
+    // Scrollbar dragging test
+    SendMessageW(toolbar->controls()[1], WM_KEYDOWN, VK_DOWN, 0);
+    menu = toolbar->menuWindow();
+    CHECK(menu && IsWindow(menu));
+    CHECK(toolbar->firstVisibleRow() == 0);
+
+    RECT menuRect{};
+    GetClientRect(menu, &menuRect);
+    LPARAM downLparam = MAKELPARAM(menuRect.right - 8, 10);
+    SendMessageW(menu, WM_LBUTTONDOWN, MK_LBUTTON, downLparam);
+
+    LPARAM moveLparam = MAKELPARAM(menuRect.right - 8, 200);
+    SendMessageW(menu, WM_MOUSEMOVE, MK_LBUTTON, moveLparam);
+    CHECK(toolbar->firstVisibleRow() > 0); // Scrolled down!
+
+    activatedPreset = -999;
+    SendMessageW(menu, WM_LBUTTONUP, 0, moveLparam);
+    CHECK(activatedPreset == -999);
+    CHECK(toolbar->menuWindow() == menu);
+
+    // Click on an enabled row
+    int targetRow = toolbar->firstVisibleRow();
+    while (targetRow < static_cast<int>(presets.size()) && (targetRow == 0 || targetRow == 21)) ++targetRow;
+    int clickY = 1 + (targetRow - toolbar->firstVisibleRow()) * 24 + 10;
+    LPARAM rowClick = MAKELPARAM(50, clickY);
+    SendMessageW(menu, WM_LBUTTONUP, 0, rowClick);
+    CHECK(!toolbar->menuWindow());
+    CHECK(activatedPreset >= 0);
+
+    toolbar.reset();
+    CHECK(DestroyWindow(parent));
+}
+
 int main() {
     testClassLifetime();
     testGripColors();
+    testPresetMenuItems();
+    testPresetMenuInteractions();
     HWND parent = CreateWindowExW(0, L"STATIC", L"FloopHole lifecycle test", WS_POPUP,
         0, 0, 640, 100, nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
     CHECK(parent);
