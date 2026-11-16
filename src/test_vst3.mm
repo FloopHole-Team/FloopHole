@@ -3,6 +3,7 @@
 #include "FLPluginScanner.h"
 #include "FLPluginInstance.h"
 #include "BridgeEditorLayout.h"
+#include "FLPathManager.h"
 
 #include "pluginterfaces/base/funknown.h"
 #include "pluginterfaces/base/ipluginbase.h"
@@ -27,6 +28,7 @@
 #include <filesystem>
 #include <set>
 #include <mach-o/dyld.h>
+#include <mach-o/getsect.h>
 #include "NativePluginCatalog.h"
 #include <limits>
 
@@ -42,6 +44,44 @@
 @end
 @implementation FLBridgeTestMinimalWindowDelegate
 - (BOOL)windowShouldClose:(NSWindow*)sender { return YES; }
+@end
+
+static NSPoint testMouseLocation;
+static double testNativeMouseScale = 1;
+static void testNativeCursorPosition(NSPoint* point) {
+    *point = NSMakePoint(testMouseLocation.x * testNativeMouseScale,
+        (NSMaxY(NSScreen.screens.firstObject.frame) - testMouseLocation.y) * testNativeMouseScale);
+}
+@interface NSEvent (FLBridgeTestMouseLocation)
++ (NSPoint)flBridgeTestMouseLocation;
+@end
+@implementation NSEvent (FLBridgeTestMouseLocation)
++ (NSPoint)flBridgeTestMouseLocation { return testMouseLocation; }
+@end
+
+@interface NSWindow (FLBridgeTestMouseLocation)
+- (NSPoint)flBridgeTestMouseLocationOutsideOfEventStream;
+@end
+@implementation NSWindow (FLBridgeTestMouseLocation)
+- (NSPoint)flBridgeTestMouseLocationOutsideOfEventStream {
+    return [self convertPointFromScreen:testMouseLocation];
+}
+@end
+@interface NSObject (FLBridgeTestNativeKeyRouting)
+- (BOOL)sendKeyEvent:(NSEvent*)event;
+- (NSWindow*)window;
+@end
+
+static NSURL* testOpenFile;
+@interface NSOpenPanel (FLBridgeTestOpenFile)
+- (NSModalResponse)flBridgeTestRunModal;
+- (NSArray<NSURL*>*)flBridgeTestURLs;
+- (NSURL*)flBridgeTestURL;
+@end
+@implementation NSOpenPanel (FLBridgeTestOpenFile)
+- (NSModalResponse)flBridgeTestRunModal { return NSModalResponseOK; }
+- (NSArray<NSURL*>*)flBridgeTestURLs { return @[testOpenFile]; }
+- (NSURL*)flBridgeTestURL { return testOpenFile; }
 @end
 
 static NSString* testPreferencesDomain = nil;
@@ -168,6 +208,36 @@ struct FLPluginInstanceTestAccess {
                                                     reinterpret_cast<intptr_t>(path));
         fprintf(stderr, "Native file dispatch result=%lld\n", static_cast<long long>(result));
         instance.initializeChannelState();
+    }
+    static std::pair<uint8_t*, size_t> edisonButton(FLPluginInstance& instance, size_t offset) {
+        CHECK(instance.getPluginName() == "Edison");
+        auto* form = *reinterpret_cast<uint8_t**>(static_cast<uint8_t*>(instance.m_plug) + 0xc8);
+        CHECK(form);
+        auto* button = *reinterpret_cast<uint8_t**>(form + offset);
+        CHECK(button);
+        auto* table = *reinterpret_cast<uintptr_t**>(button);
+        const auto* name = reinterpret_cast<const uint8_t*>(table[3]);
+        CHECK(name[0] == 9 && memcmp(name + 1, "TQuickBtn", 9) == 0 && table[0] >= 0x5a0);
+        return {button, table[0]};
+    }
+    static void** nativeCursorBinding(FLPluginInstance& instance) {
+        Dl_info image{};
+        CHECK(dladdr(reinterpret_cast<void*>(instance.m_fnDispatcher), &image));
+        auto* header = static_cast<const mach_header_64*>(image.dli_fbase);
+        void* function = dlsym(RTLD_DEFAULT, "MVScreenGetCursorPos");
+        CHECK(function && header->magic == MH_MAGIC_64);
+        void** binding = nullptr;
+        for (const char* section : {"__data", "__common", "__bss"}) {
+            unsigned long bytes = 0;
+            auto* start = reinterpret_cast<void**>(getsectiondata(header, "__DATA", section, &bytes));
+            for (size_t i = 0; start && i < bytes / sizeof(void*); ++i) {
+                if (start[i] != function) continue;
+                CHECK(!binding);
+                binding = start + i;
+            }
+        }
+        CHECK(binding);
+        return binding;
     }
 };
 }
@@ -648,6 +718,54 @@ static NSView* findVolumeKnob(NSView* parent) {
     return nil;
 }
 
+static void verifyPresetTypeSearch(NSControl* picker) {
+    NSArray<NSDictionary*>* original = [picker valueForKey:@"items"];
+    NSMutableArray<NSDictionary*>* items = [NSMutableArray array];
+    for (NSString* title in @[@"A section", @"Amber", @"Apricot", @"Pads / Warm Bass",
+                              @"Caf\u00e9 Lead", @"Cafeteria"]) {
+        [items addObject:@{@"text":title, @"preset":@([title isEqualToString:@"A section"] ? -1 : 0)}];
+    }
+    for (int i = 0; i < 20; ++i)
+        [items addObject:@{@"text":[NSString stringWithFormat:@"Unused %d", i], @"preset":@0}];
+    const NSInteger bassRow = items.count;
+    [items addObject:@{@"text":@"Bass Bell", @"preset":@0}];
+    [picker setValue:items forKey:@"items"];
+    [picker mouseDown:[NSEvent mouseEventWithType:NSEventTypeLeftMouseDown location:NSZeroPoint
+        modifierFlags:0 timestamp:NSProcessInfo.processInfo.systemUptime windowNumber:picker.window.windowNumber
+        context:nil eventNumber:1 clickCount:1 pressure:1]];
+    NSWindow* panel = [picker valueForKey:@"panel"];
+    CHECK(panel && panel.firstResponder == panel.contentView);
+    NSView* menu = panel.contentView;
+    NSTimeInterval now = NSProcessInfo.processInfo.systemUptime;
+    const auto type = [&](NSString* text, unsigned short code = 0, double pause = 0.05) {
+        now += pause;
+        [menu keyDown:[NSEvent keyEventWithType:NSEventTypeKeyDown location:NSZeroPoint modifierFlags:0
+            timestamp:now windowNumber:panel.windowNumber context:nil characters:text
+            charactersIgnoringModifiers:text isARepeat:NO keyCode:code]];
+    };
+    const auto row = [&] { return [[menu valueForKey:@"highlightedRow"] integerValue]; };
+    type(@"a"); CHECK(row() == 1);
+    type(@"A"); CHECK(row() == 2);
+    type(@"a"); CHECK(row() == 1);
+    type(@"b", 0, 1.1); CHECK(row() == bassRow);
+    CHECK([[menu valueForKey:@"firstRow"] integerValue] <= bassRow &&
+          [[menu valueForKey:@"firstRow"] integerValue] + [[menu valueForKey:@"visibleRows"] integerValue] > bassRow);
+    type(@"as"); CHECK(row() == bassRow);
+    type(@"z"); CHECK(row() == bassRow);
+    type(@"\x7f", 51); CHECK(row() == bassRow);
+    type(@"warm", 0, 1.1); CHECK(row() == 3);
+    type(@"cafe\u0301", 0, 1.1); CHECK(row() == 4);
+    type(@"\x7f", 51);
+    type(@"eteria"); CHECK(row() == 5);
+    type(@"A section", 0, 1.1); CHECK(row() == 5);
+    type(@"zz", 0, 1.1); CHECK(row() == 5);
+    type(@"a"); CHECK(row() == 1);
+    type(@"", 53);
+    CHECK([picker valueForKey:@"panel"] == nil);
+    [picker setValue:original forKey:@"items"];
+    fprintf(stderr, "Preset type-search: case-insensitive prefix/substring, cycling, timeout, Unicode backspace and scrolling passed\n");
+}
+
 static void verifyPresetPicker(NSWindow* window, IEditController* controller, ParamID outputID,
                                const char* screenshotDirectory) {
     NSControl* picker = findPresetPicker(window.contentView);
@@ -696,6 +814,7 @@ static void verifyPresetPicker(NSWindow* window, IEditController* controller, Pa
             timestamp:NSProcessInfo.processInfo.systemUptime windowNumber:window.windowNumber context:nil
             eventNumber:0 clickCount:1 pressure:1]];
     };
+    verifyPresetTypeSearch(picker);
     openPicker();
     NSWindow* firstPanel = [picker valueForKey:@"panel"];
     CHECK(firstPanel.visible);
@@ -723,6 +842,10 @@ static void verifyPresetPicker(NSWindow* window, IEditController* controller, Pa
     NSArray<NSDictionary*>* items = [picker valueForKey:@"items"];
     CHECK(row >= 0 && row < static_cast<int>(items.count) && [items[row][@"preset"] intValue] >= 0);
     NSString* expected = items[row][@"text"];
+    [menu keyDown:[NSEvent keyEventWithType:NSEventTypeKeyDown location:NSZeroPoint modifierFlags:0
+        timestamp:NSProcessInfo.processInfo.systemUptime windowNumber:panel.windowNumber context:nil
+        characters:expected.uppercaseString charactersIgnoringModifiers:expected.uppercaseString isARepeat:NO keyCode:0]];
+    CHECK([items[[[menu valueForKey:@"highlightedRow"] integerValue]][@"text"] isEqualToString:expected]);
     if (screenshotDirectory)
         captureUtilityPixels(panel, std::filesystem::u8path(screenshotDirectory) / "preset-menu.png");
     [menu keyDown:key(36)];
@@ -1712,62 +1835,84 @@ static void verifyVSTEditorReopening() {
     // as well as deferred NSView window attachment.
     [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
     [NSApp activateIgnoringOtherApps:YES];
-    info = nativeClassInfo(factory, "Newtone");
-    CHECK(factory->createInstance(info.cid, IComponent::iid, reinterpret_cast<void**>(&component)) == kResultOk);
-    CHECK(component && component->initialize(nullptr) == kResultOk);
-    CHECK(component->queryInterface(IEditController::iid, reinterpret_cast<void**>(&controller)) == kResultOk);
-    for (int cycle = 0; cycle < 3; ++cycle) {
-        @autoreleasepool {
-            view = controller->createView(ViewType::kEditor);
-            CHECK(view && view->setFrame(&frame) == kResultOk);
-            FLBridgeTestMinimalWindowDelegate* delegate = [FLBridgeTestMinimalWindowDelegate new];
-            CHECK(![delegate respondsToSelector:@selector(windowDidBecomeKey:)]);
-            CHECK(![delegate respondsToSelector:@selector(windowDidResignKey:)]);
-            NSWindow* window = [[NSWindow alloc] initWithContentRect:NSMakeRect(120, 120, 900, 700)
-                styleMask:NSWindowStyleMaskTitled backing:NSBackingStoreBuffered defer:NO];
-            window.releasedWhenClosed = NO;
-            window.delegate = delegate;
-            [window makeKeyAndOrderFront:nil];
-            [NSApp activateIgnoringOtherApps:YES];
-            NSView* hostView = nil;
-            if (cycle == 0) {
-                // Ableton Live attaches directly to [OPluginCocoaWindow contentView] while it is key.
-                hostView = window.contentView;
-                CHECK(view->attached((__bridge void*)hostView, kPlatformTypeNSView) == kResultOk);
-            } else {
-                // Also verify deferred attachment where hostView is added to window after attached().
-                hostView = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, 900, 700)];
-                CHECK(hostView.window == nil);
-                CHECK(view->attached((__bridge void*)hostView, kPlatformTypeNSView) == kResultOk);
-                [window.contentView addSubview:hostView];
-            }
-            [NSRunLoop.currentRunLoop runUntilDate:[NSDate dateWithTimeIntervalSinceNow:0.05]];
-            NSView* editor = findNativeEditor(hostView);
-            CHECK(editor != nil && editor.window == window && !editor.hiddenOrHasHiddenAncestor);
-            NSWindow* vstWindow = nil;
-            for (NSWindow* candidate in NSApp.windows) {
-                if ([NSStringFromClass(object_getClass(candidate)) isEqualToString:@"VstWindow"] &&
-                    candidate.parentWindow == window) {
-                    vstWindow = candidate;
-                    break;
+    for (const char* name : {"Newtone", "Newtime"}) {
+        info = nativeClassInfo(factory, name);
+        CHECK(factory->createInstance(info.cid, IComponent::iid, reinterpret_cast<void**>(&component)) == kResultOk);
+        CHECK(component && component->initialize(nullptr) == kResultOk);
+        CHECK(component->queryInterface(IEditController::iid, reinterpret_cast<void**>(&controller)) == kResultOk);
+        for (int cycle = 0; cycle < 3; ++cycle) {
+            @autoreleasepool {
+                view = controller->createView(ViewType::kEditor);
+                CHECK(view && view->setFrame(&frame) == kResultOk);
+                FLBridgeTestMinimalWindowDelegate* delegate = [FLBridgeTestMinimalWindowDelegate new];
+                CHECK(![delegate respondsToSelector:@selector(windowDidBecomeKey:)]);
+                CHECK(![delegate respondsToSelector:@selector(windowDidResignKey:)]);
+                NSWindow* window = [[NSWindow alloc] initWithContentRect:NSMakeRect(120, 120, 900, 700)
+                    styleMask:NSWindowStyleMaskTitled backing:NSBackingStoreBuffered defer:NO];
+                window.releasedWhenClosed = NO;
+                window.delegate = delegate;
+                [window makeKeyAndOrderFront:nil];
+                [NSApp activateIgnoringOtherApps:YES];
+                NSView* hostView = nil;
+                if (cycle == 0) {
+                    // Ableton Live attaches directly to [OPluginCocoaWindow contentView] while it is key.
+                    hostView = window.contentView;
+                    CHECK(view->attached((__bridge void*)hostView, kPlatformTypeNSView) == kResultOk);
+                } else {
+                    // Also verify deferred attachment where hostView is added to window after attached().
+                    hostView = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, 900, 700)];
+                    CHECK(hostView.window == nil);
+                    CHECK(view->attached((__bridge void*)hostView, kPlatformTypeNSView) == kResultOk);
+                    [window.contentView addSubview:hostView];
                 }
+                [NSRunLoop.currentRunLoop runUntilDate:[NSDate dateWithTimeIntervalSinceNow:0.15]];
+                NSView* editor = findNativeEditor(hostView);
+                CHECK(editor != nil && editor.window == window && !editor.hiddenOrHasHiddenAncestor);
+                NSWindow* vstWindow = nil;
+                for (NSWindow* candidate in NSApp.windows) {
+                    if ([NSStringFromClass(object_getClass(candidate)) isEqualToString:@"VstWindow"] &&
+                        candidate.parentWindow == window) {
+                        vstWindow = candidate;
+                        break;
+                    }
+                }
+                CHECK(vstWindow != nil && vstWindow.contentView != nil);
+                CHECK(NSIntersectsRect(vstWindow.frame, window.frame));
+                // Explicitly trigger VstWindow's key-window delegate notifications against the minimal host delegate.
+                [(id<NSWindowDelegate>)vstWindow.delegate windowDidBecomeKey:
+                    [NSNotification notificationWithName:NSWindowDidBecomeKeyNotification object:vstWindow]];
+                [(id<NSWindowDelegate>)vstWindow.delegate windowDidResignKey:
+                    [NSNotification notificationWithName:NSWindowDidResignKeyNotification object:vstWindow]];
+                const NSRect initialHostFrame = window.frame;
+                const NSRect initialChildFrame = vstWindow.frame;
+                const NSRect initialEditorFrame = editor.frame;
+                __block int childMoves = 0;
+                id moveObserver = [NSNotificationCenter.defaultCenter
+                    addObserverForName:NSWindowDidMoveNotification object:vstWindow queue:nil
+                    usingBlock:^(NSNotification*) { ++childMoves; }];
+                for (int step = 1; step <= 12; ++step) {
+                    const NSPoint delta = NSMakePoint(step * 7, step * 3);
+                    [window setFrameOrigin:NSMakePoint(initialHostFrame.origin.x + delta.x,
+                                                      initialHostFrame.origin.y + delta.y)];
+                    [NSRunLoop.currentRunLoop runUntilDate:[NSDate dateWithTimeIntervalSinceNow:0.05]];
+                    CHECK(NSEqualRects(editor.frame, initialEditorFrame));
+                    CHECK(std::abs(vstWindow.frame.origin.x - initialChildFrame.origin.x - delta.x) < 0.5);
+                    CHECK(std::abs(vstWindow.frame.origin.y - initialChildFrame.origin.y - delta.y) < 0.5);
+                }
+                [NSNotificationCenter.defaultCenter removeObserver:moveObserver];
+                fprintf(stderr, "%s cycle %d: child-window moves during 12 host moves: %d\n", name, cycle, childMoves);
+                CHECK(childMoves <= 12);
+                CHECK(view->removed() == kResultOk);
+                view->release();
+                if (hostView != window.contentView) [hostView removeFromSuperview];
+                window.delegate = nil;
+                [window close];
             }
-            CHECK(vstWindow != nil && vstWindow.contentView != nil);
-            // Explicitly trigger VstWindow's key-window delegate notifications against the minimal host delegate.
-            [(id<NSWindowDelegate>)vstWindow.delegate windowDidBecomeKey:
-                [NSNotification notificationWithName:NSWindowDidBecomeKeyNotification object:vstWindow]];
-            [(id<NSWindowDelegate>)vstWindow.delegate windowDidResignKey:
-                [NSNotification notificationWithName:NSWindowDidResignKeyNotification object:vstWindow]];
-            CHECK(view->removed() == kResultOk);
-            view->release();
-            if (hostView != window.contentView) [hostView removeFromSuperview];
-            window.delegate = nil;
-            [window close];
         }
+        controller->release();
+        component->terminate();
+        component->release();
     }
-    controller->release();
-    component->terminate();
-    component->release();
     factory->release();
     CHECK(bundleExit());
     dlclose(bundle);
@@ -2210,6 +2355,230 @@ static void verifyTransportUtilities(const char* screenshotDirectory) {
     }
 }
 
+static void verifyEdisonMouseInput() {
+    flbr::FLPluginInstance instance;
+    CHECK(instance.loadPluginByName("Edison"));
+    NSWindow* window = [[NSWindow alloc] initWithContentRect:NSMakeRect(120, 120, 900, 700)
+        styleMask:NSWindowStyleMaskTitled backing:NSBackingStoreBuffered defer:NO];
+    window.releasedWhenClosed = NO;
+    int width = 0, height = 0;
+    CHECK(instance.attachEditorToNSView((__bridge void*)window.contentView, width, height));
+    [window setContentSize:NSMakeSize(width, height)];
+    [window makeKeyAndOrderFront:nil];
+    [NSApp activateIgnoringOtherApps:YES];
+    [NSRunLoop.currentRunLoop runUntilDate:[NSDate dateWithTimeIntervalSinceNow:0.2]];
+    NSView* editor = findNativeEditor(window.contentView);
+    CHECK(editor);
+    Ivar ownerIvar = class_getInstanceVariable(NSClassFromString(@"D1NSView"), "owner");
+    Ivar pressedIvar = class_getInstanceVariable(NSClassFromString(@"MVWindow"), "fMouseButtonState");
+    CHECK(ownerIvar && pressedIvar);
+    id nativeWindow = object_getIvar(editor, ownerIvar);
+    CHECK(nativeWindow);
+    CHECK([editor window] == window);
+    Class editorClass = object_getClass(editor);
+    SEL invalidate = NSSelectorFromString(@"invalidate");
+    Method invalidateMethod = class_getInstanceMethod(editorClass, invalidate);
+    CHECK(invalidateMethod);
+    auto originalInvalidate = reinterpret_cast<void (*)(id, SEL)>(method_getImplementation(invalidateMethod));
+    __block int redraws = 0;
+    IMP countedInvalidate = imp_implementationWithBlock(^(NSView* view) {
+        ++redraws;
+        originalInvalidate(view, invalidate);
+    });
+    class_addMethod(editorClass, invalidate, reinterpret_cast<IMP>(originalInvalidate), method_getTypeEncoding(invalidateMethod));
+    Method countedMethod = class_getInstanceMethod(editorClass, invalidate);
+    method_setImplementation(countedMethod, countedInvalidate);
+    const auto pressed = [&] {
+        int32_t state = 0;
+        memcpy(&state, static_cast<const uint8_t*>((__bridge const void*)nativeWindow) + ivar_getOffset(pressedIvar),
+               sizeof(state));
+        return (state & 0x10) != 0;
+    };
+    bool hasHoverTracking = false;
+    for (NSTrackingArea* area in editor.trackingAreas) {
+        if (area.owner == editor && (area.options & NSTrackingMouseMoved) &&
+            (area.options & NSTrackingMouseEnteredAndExited) && (area.options & NSTrackingInVisibleRect))
+            hasHoverTracking = true;
+    }
+    CHECK(hasHoverTracking);
+    CHECK([NSStringFromClass(object_getClass(editor)) hasPrefix:@"FLBridgeMouse_"]);
+    CHECK(editor.class == NSClassFromString(@"MVCustomControl"));
+    // Normalize toolbar targets from the 957x628 editor layout.
+    const NSPoint center = NSMakePoint(width * (667.0 - 16.0) / (973.0 - 16.0),
+                                      height * (160.0 - 105.0) / (733.0 - 105.0));
+    CHECK(NSPointInRect(center, editor.bounds));
+    Method mouseLocation = class_getClassMethod(NSEvent.class, @selector(mouseLocation));
+    Method testLocation = class_getClassMethod(NSEvent.class, @selector(flBridgeTestMouseLocation));
+    method_exchangeImplementations(mouseLocation, testLocation);
+    Method windowMouseLocation = class_getInstanceMethod(NSWindow.class, @selector(mouseLocationOutsideOfEventStream));
+    Method testWindowLocation = class_getInstanceMethod(NSWindow.class, @selector(flBridgeTestMouseLocationOutsideOfEventStream));
+    method_exchangeImplementations(windowMouseLocation, testWindowLocation);
+    // VCL polls CoreGraphics separately from NSEvent. Replace only this test
+    // instance's resolved cursor service so the physical pointer stays untouched.
+    void** cursorBinding = flbr::FLPluginInstanceTestAccess::nativeCursorBinding(instance);
+    void* originalCursorBinding = *cursorBinding;
+    *cursorBinding = reinterpret_cast<void*>(testNativeCursorPosition);
+    testNativeMouseScale = window.backingScaleFactor;
+    std::string hint;
+    instance.onHintChanged = [&](const std::string& text) { hint = text; };
+    int eventNumber = 0;
+    const auto send = [&](NSEventType type, NSPoint point) {
+        NSEvent* event = [NSEvent mouseEventWithType:type location:[editor convertPoint:point toView:nil]
+            modifierFlags:0 timestamp:NSProcessInfo.processInfo.systemUptime windowNumber:window.windowNumber
+            context:nil eventNumber:++eventNumber clickCount:type == NSEventTypeMouseMoved ? 0 : 1
+            pressure:type == NSEventTypeLeftMouseDown ? 1 : 0];
+        testMouseLocation = [window convertPointToScreen:event.locationInWindow];
+        [NSApp postEvent:event atStart:YES];
+        NSEvent* dispatched = [NSApp nextEventMatchingMask:static_cast<NSEventMask>(1ULL << type)
+            untilDate:NSDate.date inMode:NSDefaultRunLoopMode dequeue:YES];
+        NSView* target = [editor hitTest:[editor convertPoint:point toView:editor.superview]] ?: editor;
+        NSEvent* delivered = dispatched ?: event;
+        if (type == NSEventTypeMouseMoved) [target mouseMoved:delivered];
+        else if (type == NSEventTypeLeftMouseDown) [target mouseDown:delivered];
+        else [target mouseUp:delivered];
+        instance.idleEditor();
+        [NSRunLoop.currentRunLoop runUntilDate:[NSDate dateWithTimeIntervalSinceNow:0.05]];
+        instance.idleEditor();
+    };
+    flbr::FLPathManager paths;
+    char sample[flbr::PathBufferLength]{};
+    char folder[] = "", extension[] = ".wav";
+    paths.randomDirFile(flbr::FLData_Packs, folder, extension, 1u << 3, 1u << flbr::PI_Factory, 0, sample);
+    CHECK(*sample);
+    testOpenFile = [NSURL fileURLWithPath:[NSString stringWithUTF8String:sample]];
+    const auto swapFilePanel = [] {
+        for (auto selectors : {
+            std::make_pair(@selector(runModal), @selector(flBridgeTestRunModal)),
+            std::make_pair(@selector(URLs), @selector(flBridgeTestURLs)),
+            std::make_pair(@selector(URL), @selector(flBridgeTestURL))}) {
+            Method original = class_getInstanceMethod(NSOpenPanel.class, selectors.first);
+            class_addMethod(NSOpenPanel.class, selectors.first, method_getImplementation(original), method_getTypeEncoding(original));
+            method_exchangeImplementations(class_getInstanceMethod(NSOpenPanel.class, selectors.first),
+                class_getInstanceMethod(NSOpenPanel.class, selectors.second));
+        }
+    };
+    swapFilePanel();
+    send(NSEventTypeLeftMouseDown, NSMakePoint(width / 2.0, height / 2.0));
+    send(NSEventTypeLeftMouseUp, NSMakePoint(-10, -10));
+    swapFilePanel();
+    testOpenFile = nil;
+    send(NSEventTypeMouseMoved, NSMakePoint(32, 73));
+    CHECK(hint.find("File") != std::string::npos);
+    const int beforeMove = redraws;
+    auto runInfo = flbr::FLPluginInstanceTestAccess::edisonButton(instance, 0x978);
+    uint8_t* runButton = runInfo.first;
+    const size_t runBytes = runInfo.second;
+    // FL 2026's TCustomQuickBtn uses 0x549 for Down and 0x54b for MouseOver.
+    // Check the button itself, not just the native window's mouse modifiers.
+    CHECK(runBytes > 0x54b && runButton[0x54b] == 0);
+    send(NSEventTypeMouseMoved, center);
+    CHECK(runButton[0x54b] == 1);
+    CHECK(redraws > beforeMove);
+    send(NSEventTypeMouseMoved, NSMakePoint(32, 73));
+    CHECK(runButton[0x54b] == 0);
+    send(NSEventTypeMouseMoved, center);
+    CHECK(runButton[0x54b] == 1);
+    const NSPoint fadeIn = NSMakePoint(width * (616.0 - 16.0) / (973.0 - 16.0), center.y);
+    auto fadeInfo = flbr::FLPluginInstanceTestAccess::edisonButton(instance, 0x950);
+    uint8_t* fadeButton = fadeInfo.first;
+    send(NSEventTypeMouseMoved, fadeIn);
+    CHECK(fadeButton[0x54b] == 1 && runButton[0x54b] == 0);
+    send(NSEventTypeLeftMouseDown, fadeIn);
+    CHECK(pressed());
+    CHECK(fadeButton[0x549] == 1 && fadeButton[0x54b] == 1);
+    const int beforeRelease = redraws;
+    send(NSEventTypeLeftMouseUp, NSMakePoint(-10, -10));
+    CHECK(!pressed());
+    CHECK(fadeButton[0x549] == 0 && fadeButton[0x54b] == 0);
+    CHECK(redraws > beforeRelease);
+    send(NSEventTypeMouseMoved, fadeIn);
+    send(NSEventTypeLeftMouseDown, fadeIn);
+    CHECK(fadeButton[0x549] == 1);
+    send(NSEventTypeLeftMouseUp, fadeIn);
+    CHECK(fadeButton[0x549] == 0 && fadeButton[0x54b] == 1);
+    send(NSEventTypeMouseMoved, NSMakePoint(-10, -10));
+    CHECK(fadeButton[0x549] == 0 && fadeButton[0x54b] == 0);
+    send(NSEventTypeMouseMoved, center);
+    NSEvent* release = [NSEvent mouseEventWithType:NSEventTypeLeftMouseUp
+        location:[editor convertPoint:center toView:nil] modifierFlags:0
+        timestamp:NSProcessInfo.processInfo.systemUptime windowNumber:window.windowNumber
+        context:nil eventNumber:++eventNumber clickCount:1 pressure:0];
+    [NSApp postEvent:release atStart:NO];
+    NSArray<NSWindow*>* previousWindows = NSApp.windows;
+    __block int nativePopupCount = 0;
+    NSTimer* closePopup = [NSTimer timerWithTimeInterval:0.1 repeats:NO block:^(NSTimer*) {
+        for (NSWindow* popup in NSApp.windows) {
+            if ([previousWindows containsObject:popup] || ![popup.delegate respondsToSelector:@selector(sendKeyEvent:)])
+                continue;
+            ++nativePopupCount;
+            CHECK(popup.contentView && popup.frame.size.width > 20 && popup.frame.size.height > 20);
+            NSEvent* escape = [NSEvent keyEventWithType:NSEventTypeKeyDown location:NSZeroPoint modifierFlags:0
+                timestamp:NSProcessInfo.processInfo.systemUptime windowNumber:popup.windowNumber context:nil
+                characters:@"\x1b" charactersIgnoringModifiers:@"\x1b" isARepeat:NO keyCode:53];
+            [(id)popup.delegate sendKeyEvent:escape];
+        }
+    }];
+    [NSRunLoop.currentRunLoop addTimer:closePopup forMode:NSRunLoopCommonModes];
+    send(NSEventTypeLeftMouseDown, center);
+    send(NSEventTypeLeftMouseUp, center);
+    CHECK(nativePopupCount == 1 && !pressed());
+    [closePopup invalidate];
+    NSArray<NSWindow*>* beforeEffect = NSApp.windows;
+    __block int effectWindows = 0;
+    NSHashTable<NSWindow*>* closedEffects = [NSHashTable weakObjectsHashTable];
+    NSTimer* closeEffect = [NSTimer timerWithTimeInterval:0.1 repeats:YES block:^(NSTimer*) {
+        for (NSWindow* effect in NSApp.windows) {
+            if ([beforeEffect containsObject:effect] || [closedEffects containsObject:effect] ||
+                ![effect.delegate respondsToSelector:@selector(sendKeyEvent:)]) continue;
+            [closedEffects addObject:effect];
+            ++effectWindows;
+            CHECK([effect.delegate respondsToSelector:@selector(windowShouldClose:)]);
+            if ([(id<NSWindowDelegate>)effect.delegate windowShouldClose:effect]) [effect close];
+        }
+    }];
+    [NSRunLoop.currentRunLoop addTimer:closeEffect forMode:NSRunLoopCommonModes];
+    const NSPoint reverb = NSMakePoint(width * (767.0 - 16.0) / (973.0 - 16.0),
+                                       height * (201.0 - 105.0) / (733.0 - 105.0));
+    send(NSEventTypeLeftMouseDown, reverb);
+    send(NSEventTypeLeftMouseUp, reverb);
+    [closeEffect invalidate];
+    CHECK(effectWindows == 1 && !pressed());
+    send(NSEventTypeMouseMoved, NSMakePoint(-10, -10));
+    CHECK(runButton[0x54b] == 0);
+    send(NSEventTypeMouseMoved, center);
+    CHECK(runButton[0x54b] == 1);
+    [editor mouseExited:[NSEvent enterExitEventWithType:NSEventTypeMouseExited
+        location:[editor convertPoint:center toView:nil] modifierFlags:0
+        timestamp:NSProcessInfo.processInfo.systemUptime windowNumber:window.windowNumber context:nil
+        eventNumber:++eventNumber trackingNumber:1 userData:nullptr]];
+    CHECK(runButton[0x54b] == 0);
+    method_setImplementation(countedMethod, reinterpret_cast<IMP>(originalInvalidate));
+    imp_removeBlock(countedInvalidate);
+    send(NSEventTypeMouseMoved, fadeIn);
+    CHECK(fadeButton[0x54b] == 1);
+    instance.detachEditor();
+    CHECK(fadeButton[0x54b] == 0);
+    CHECK(object_getClass(editor) == NSClassFromString(@"MVCustomControl"));
+    [window close];
+    window = [[NSWindow alloc] initWithContentRect:NSMakeRect(120, 120, width, height)
+        styleMask:NSWindowStyleMaskTitled backing:NSBackingStoreBuffered defer:NO];
+    window.releasedWhenClosed = NO;
+    CHECK(instance.attachEditorToNSView((__bridge void*)window.contentView, width, height));
+    editor = findNativeEditor(window.contentView);
+    [window makeKeyAndOrderFront:nil];
+    [NSRunLoop.currentRunLoop runUntilDate:[NSDate dateWithTimeIntervalSinceNow:0.1]];
+    fadeButton = flbr::FLPluginInstanceTestAccess::edisonButton(instance, 0x950).first;
+    send(NSEventTypeMouseMoved, fadeIn);
+    CHECK(fadeButton[0x54b] == 1);
+    instance.detachEditor();
+    CHECK(fadeButton[0x54b] == 0);
+    *cursorBinding = originalCursorBinding;
+    method_exchangeImplementations(windowMouseLocation, testWindowLocation);
+    method_exchangeImplementations(mouseLocation, testLocation);
+    [window close];
+    fprintf(stderr, "Edison native button hover/Down flags, inside/outside release, mouse exit, RUN/effect close and reopening passed\n");
+}
+
 int main(int argc, char** argv) {
     @autoreleasepool {
         if (argc > 1 && strcmp(argv[1], "--catalog") == 0) {
@@ -2217,6 +2586,10 @@ int main(int argc, char** argv) {
             return 0;
         }
         [NSApplication sharedApplication];
+        if (argc > 1 && strcmp(argv[1], "--edison-input") == 0) {
+            verifyEdisonMouseInput();
+            return 0;
+        }
         if (argc > 1 && strcmp(argv[1], "--master-volume") == 0) {
             verifyMasterVolume(argc > 2 ? argv[2] : nullptr);
             return 0;

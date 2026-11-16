@@ -14,6 +14,7 @@ constexpr uint32_t FLData_Internet = 1021;
 constexpr uint32_t FLData_SystemData = 1025;
 constexpr uint32_t FLData_Packs = 1037;
 constexpr uint32_t FLData_SharedPacks = 1045;
+constexpr uint32_t FLData_AudioScripts = 1046;
 constexpr uint32_t PathBufferLength = 1024;
 
 struct FLScanDirCallback {

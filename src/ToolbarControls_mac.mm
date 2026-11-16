@@ -114,6 +114,8 @@ static void drawSurface(NSRect bounds, BOOL hover, BOOL pressed) {
 @implementation FloopHoleMenuView {
     NSTrackingArea* _tracking;
     CGFloat _scrollDelta;
+    NSString* _searchQuery;
+    NSTimeInterval _lastSearchTime;
 }
 - (BOOL)isFlipped { return YES; }
 - (BOOL)acceptsFirstResponder { return YES; }
@@ -172,6 +174,7 @@ static void drawSurface(NSRect bounds, BOOL hover, BOOL pressed) {
     if (row >= 0) [self.picker chooseRow:row];
 }
 - (void)scrollWheel:(NSEvent*)event {
+    _searchQuery = nil;
     NSInteger steps = 0;
     if (event.hasPreciseScrollingDeltas) {
         _scrollDelta += event.scrollingDeltaY;
@@ -181,19 +184,89 @@ static void drawSurface(NSRect bounds, BOOL hover, BOOL pressed) {
     _firstRow = std::clamp<NSInteger>(_firstRow - steps, 0, MAX(0, (NSInteger)self.picker.items.count - _visibleRows));
     [self setNeedsDisplay:YES];
 }
+- (void)highlightRow:(NSInteger)row {
+    _highlightedRow = row;
+    if (row < _firstRow) _firstRow = row;
+    if (row >= _firstRow + _visibleRows) _firstRow = row - _visibleRows + 1;
+    [self setNeedsDisplay:YES];
+}
+- (NSInteger)findMatch:(NSString*)query {
+    if (query.length == 0) return -1;
+    NSArray<NSDictionary*>* items = self.picker.items;
+    for (int pass = 0; pass < 2; ++pass) {
+        const NSStringCompareOptions options = NSCaseInsensitiveSearch | (pass == 0 ? NSAnchoredSearch : 0);
+        for (NSInteger row = 0; row < (NSInteger)items.count; ++row) {
+            if ([items[row][@"preset"] intValue] < 0) continue;
+            if ([items[row][@"text"] rangeOfString:query options:options].location != NSNotFound) return row;
+        }
+    }
+    return -1;
+}
+- (void)searchForCharacters:(NSString*)characters timestamp:(NSTimeInterval)now {
+    if ([characters isEqualToString:@" "] && _searchQuery.length == 0) return;
+    const BOOL expired = now - _lastSearchTime > 1.0 || now < _lastSearchTime;
+    NSArray<NSDictionary*>* items = self.picker.items;
+    if (!expired && _searchQuery.length == 1 && characters.length == 1 &&
+        [_searchQuery compare:characters options:NSCaseInsensitiveSearch] == NSOrderedSame) {
+        _lastSearchTime = now;
+        for (NSInteger offset = 1; offset <= (NSInteger)items.count; ++offset) {
+            const NSInteger row = (_highlightedRow + offset) % (NSInteger)items.count;
+            if ([items[row][@"preset"] intValue] >= 0 &&
+                [items[row][@"text"] rangeOfString:characters
+                    options:NSCaseInsensitiveSearch | NSAnchoredSearch].location != NSNotFound) {
+                [self highlightRow:row];
+                return;
+            }
+        }
+        return;
+    }
+    NSString* query = expired || _searchQuery.length == 0 ? characters : [_searchQuery stringByAppendingString:characters];
+    const NSInteger row = [self findMatch:query];
+    if (row >= 0) {
+        _searchQuery = query;
+        _lastSearchTime = now;
+        [self highlightRow:row];
+    } else if (expired) {
+        _searchQuery = nil;
+        _lastSearchTime = now;
+    }
+}
 - (void)keyDown:(NSEvent*)event {
     if (event.keyCode == 53) { [self.picker closeMenu]; return; }
     if (event.keyCode == 36 || event.keyCode == 76) { [self.picker chooseRow:_highlightedRow]; return; }
-    if (event.keyCode != 125 && event.keyCode != 126) { [super keyDown:event]; return; }
+    if (event.modifierFlags & (NSEventModifierFlagCommand | NSEventModifierFlagControl)) {
+        [super keyDown:event];
+        return;
+    }
+    if (event.keyCode == 51 || event.keyCode == 117) {
+        if (_searchQuery.length) {
+            _searchQuery = [_searchQuery substringToIndex:
+                [_searchQuery rangeOfComposedCharacterSequenceAtIndex:_searchQuery.length - 1].location];
+            _lastSearchTime = event.timestamp;
+            const NSInteger row = [self findMatch:_searchQuery];
+            if (row >= 0) [self highlightRow:row];
+        }
+        return;
+    }
+    if (event.keyCode != 125 && event.keyCode != 126) {
+        NSString* characters = event.characters;
+        if (characters.length &&
+            [characters rangeOfCharacterFromSet:NSCharacterSet.controlCharacterSet].location == NSNotFound &&
+            !([characters characterAtIndex:0] >= NSUpArrowFunctionKey &&
+              [characters characterAtIndex:0] <= NSModeSwitchFunctionKey)) {
+            [self searchForCharacters:characters timestamp:event.timestamp];
+            return;
+        }
+        [super keyDown:event];
+        return;
+    }
+    _searchQuery = nil;
     const NSInteger direction = event.keyCode == 125 ? 1 : -1;
     NSInteger row = _highlightedRow;
     do { row += direction; }
     while (row >= 0 && row < (NSInteger)self.picker.items.count && [self.picker.items[row][@"preset"] intValue] < 0);
     if (row < 0 || row >= (NSInteger)self.picker.items.count) return;
-    _highlightedRow = row;
-    if (row < _firstRow) _firstRow = row;
-    if (row >= _firstRow + _visibleRows) _firstRow = row - _visibleRows + 1;
-    [self setNeedsDisplay:YES];
+    [self highlightRow:row];
 }
 @end
 

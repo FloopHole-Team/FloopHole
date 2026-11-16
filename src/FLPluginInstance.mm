@@ -28,6 +28,12 @@ struct MacVCLPropWriter {
     int size;
 };
 
+static char stagingWindowKey;
+static char vstWindowsKey;
+static char vstWindowOffsetKey;
+static char vstWindowHostOriginKey;
+static char vstWindowOwnerKey;
+
 static NSView* hostedEditorForWindow(NSWindow* window) {
     id windowWrapper = window.delegate;
     // Disposed auxiliary windows can keep an unowned savedContentView pointer.
@@ -76,15 +82,35 @@ static Class hostedWindowClass() {
     return subclass;
 }
 
-static char stagingWindowKey;
-static char vstWindowsKey;
-
 static void installVstWindowSafeHandlers() {
     Class vstWindowClass = NSClassFromString(@"VstWindow");
     if (!vstWindowClass) return;
     static bool installed = false;
     if (installed) return;
     installed = true;
+    SEL frameSelector = @selector(setFrame:display:);
+    Method frameMethod = class_getInstanceMethod(vstWindowClass, frameSelector);
+    auto setFrame = reinterpret_cast<void (*)(id, SEL, NSRect, BOOL)>(
+        method_getImplementation(frameMethod));
+    IMP frameImp = imp_implementationWithBlock(^(NSWindow* window, NSRect frame, BOOL display) {
+        NSValue* offset = objc_getAssociatedObject(window, &vstWindowOffsetKey);
+        NSValue* hostOrigin = objc_getAssociatedObject(window, &vstWindowHostOriginKey);
+        if (offset && hostOrigin && window.parentWindow &&
+            !NSEqualPoints(hostOrigin.pointValue, window.parentWindow.frame.origin) &&
+            NSEqualSizes(frame.size, window.frame.size)) {
+            // MacVCL can request the last idle position after Cocoa has already
+            // moved the child with the host. Keep its host-relative placement.
+            frame.origin = NSMakePoint(window.parentWindow.frame.origin.x + offset.pointValue.x,
+                                       window.parentWindow.frame.origin.y + offset.pointValue.y);
+        } else if (offset && window.parentWindow) {
+            objc_setAssociatedObject(window, &vstWindowOffsetKey,
+                [NSValue valueWithPoint:NSMakePoint(frame.origin.x - window.parentWindow.frame.origin.x,
+                                                   frame.origin.y - window.parentWindow.frame.origin.y)],
+                OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        }
+        setFrame(window, frameSelector, frame, display);
+    });
+    class_addMethod(vstWindowClass, frameSelector, frameImp, method_getTypeEncoding(frameMethod));
     for (SEL selector : {@selector(windowDidBecomeKey:), @selector(windowDidResignKey:)}) {
         Method method = class_getInstanceMethod(vstWindowClass, selector);
         if (!method) continue;
@@ -148,6 +174,8 @@ static void synchronizeEditorWindow(NSView* parentView) {
     NSHashTable<NSWindow*>* vstWindows = objc_getAssociatedObject(parentView, &vstWindowsKey);
     for (NSWindow* vstWindow in vstWindows.allObjects) {
         if (hostWindow != stagingWindow && vstWindow.parentWindow != hostWindow) {
+            objc_setAssociatedObject(vstWindow, &vstWindowOffsetKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            objc_setAssociatedObject(vstWindow, &vstWindowHostOriginKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
             if (vstWindow.parentWindow) [vstWindow.parentWindow removeChildWindow:vstWindow];
             if ([vstWindow respondsToSelector:@selector(setParent:)]) [vstWindow setParent:hostWindow];
             if ([vstWindow respondsToSelector:@selector(updateParent)]) [vstWindow updateParent];
@@ -173,6 +201,17 @@ static void synchronizeEditorWindow(NSView* parentView) {
             [delegate windowDidMove:[NSNotification notificationWithName:NSWindowDidMoveNotification
                                                                  object:backingWindow]];
         }
+    }
+    for (NSWindow* window in vstWindows.allObjects) {
+        if (hostWindow == stagingWindow || window.parentWindow != hostWindow ||
+            !NSIntersectsRect(window.frame, hostWindow.frame) ||
+            objc_getAssociatedObject(window, &vstWindowOffsetKey)) continue;
+        objc_setAssociatedObject(window, &vstWindowOffsetKey,
+            [NSValue valueWithPoint:NSMakePoint(window.frame.origin.x - hostWindow.frame.origin.x,
+                                               window.frame.origin.y - hostWindow.frame.origin.y)],
+            OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        objc_setAssociatedObject(window, &vstWindowHostOriginKey,
+            [NSValue valueWithPoint:hostWindow.frame.origin], OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     }
 }
 
@@ -245,7 +284,12 @@ static char fileDropTypesKey;
 static char fileDropViewsKey;
 
 static Class hostedNativeViewClass(id view, SEL) {
-    return class_getSuperclass(object_getClass(view));
+    Class original = class_getSuperclass(object_getClass(view));
+    while ([NSStringFromClass(original) hasPrefix:@"FLBridgeFileDrop_"] ||
+           [NSStringFromClass(original) hasPrefix:@"FLBridgeScrollWheel_"] ||
+           [NSStringFromClass(original) hasPrefix:@"FLBridgeMouse_"])
+        original = class_getSuperclass(original);
+    return original;
 }
 
 static NSURL* hostedDropURL(NSView* view, id<NSDraggingInfo> sender) {
@@ -340,6 +384,156 @@ static void removeFileDropHandler(NSView* view) {
 
 static char scrollWindowKey;
 static char scrollViewsKey;
+static char mouseWindowKey;
+static char mouseViewsKey;
+static char mouseTrackingKey;
+static char mouseHoveredControlKey;
+static char mouseLocationKey;
+static char mouseApplicationEditorKey;
+
+struct MacVCLAppInputState {
+    void* capturedControl;
+    void* mouseControl;
+    void* popupMenu;
+    int32_t modifiers, character, modifiedCharacter;
+    void* modalForm;
+    void* screen;
+    void* dragSource;
+    int32_t dragging;
+    void* hintControl;
+};
+
+static bool isNativeQuickButton(void* control) {
+    if (!control) return false;
+    auto* vmt = *static_cast<uintptr_t**>(control);
+    for (int depth = 0; vmt && depth < 32; ++depth) {
+        const auto* name = reinterpret_cast<const uint8_t*>(vmt[3]);
+        if (name && name[0] == 9 && memcmp(name + 1, "TQuickBtn", 9) == 0) return true;
+        vmt = vmt[2] ? *reinterpret_cast<uintptr_t**>(vmt[2]) : nullptr;
+    }
+    return false;
+}
+
+static void setNativeButtonHover(NSView* editor, void* control) {
+    void* previous = [objc_getAssociatedObject(editor, &mouseHoveredControlKey) pointerValue];
+    if (previous == control) return;
+    objc_setAssociatedObject(editor, &mouseHoveredControlKey,
+        control ? [NSValue valueWithPointer:control] : nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    // Free Pascal TObject.Dispatch is VMT slot 20. Use the controls' existing
+    // CM_MOUSELEAVE/CM_MOUSEENTER handlers, not their private visual-state fields.
+    for (auto transition : {std::make_pair(previous, uintptr_t{0xb014}),
+                            std::make_pair(control, uintptr_t{0xb013})}) {
+        if (!transition.first) continue;
+        std::array<uintptr_t, 4> message{transition.second, 0, 0, 0};
+        auto* vmt = *static_cast<uintptr_t**>(transition.first);
+        reinterpret_cast<void (*)(void*, void*)>(vmt[20])(transition.first, message.data());
+    }
+    invalidateNativeEditor(editor);
+}
+
+static MacVCLAppInputState* nativeInputState(id windowWrapper, id* nativeApplication = nullptr) {
+    NSWindow* backing = [windowWrapper window];
+    Ivar applicationIvar = class_getInstanceVariable(object_getClass(backing), "MVApp");
+    id application = applicationIvar ? object_getIvar(backing, applicationIvar) : nil;
+    using GetInputState = MacVCLAppInputState* (*)(void*);
+    static auto getInputState = reinterpret_cast<GetInputState>(dlsym(RTLD_DEFAULT, "MVApplicationGetGlobalState"));
+    if (nativeApplication) *nativeApplication = application;
+    return application && getInputState ? getInputState((__bridge void*)application) : nullptr;
+}
+
+static void updateNativeButtonHover(id windowWrapper, NSView* editor, NSPoint point) {
+    if (!editor) return;
+    if (!NSPointInRect(point, editor.bounds)) {
+        setNativeButtonHover(editor, nullptr);
+        return;
+    }
+    id application = nil;
+    auto* state = nativeInputState(windowWrapper, &application);
+    NSHashTable<NSView*>* reference = objc_getAssociatedObject(application, &mouseApplicationEditorKey);
+    if (!state || reference.anyObject != editor) {
+        setNativeButtonHover(editor, nullptr);
+        return;
+    }
+    if (state->capturedControl) return;
+    // Library-mode VCL skips its own hover polling. Mouse dispatch still resolves
+    // the real target into HintControl, so the host can supply enter/leave.
+    setNativeButtonHover(editor, isNativeQuickButton(state->hintControl) ? state->hintControl : nullptr);
+}
+
+static void hostedMouseEvent(NSView* view, SEL selector, NSEvent* event) {
+    NSHashTable* reference = objc_getAssociatedObject(view, &mouseWindowKey);
+    id windowWrapper = reference.anyObject;
+    NSView* editor = [[windowWrapper window] savedContentView];
+    id application = nil;
+    nativeInputState(windowWrapper, &application);
+    if (editor && application) {
+        NSHashTable<NSView*>* owner = objc_getAssociatedObject(application, &mouseApplicationEditorKey);
+        if (NSView* previous = owner.anyObject; previous && previous != editor)
+            setNativeButtonHover(previous, nullptr);
+        if (!owner) {
+            owner = [NSHashTable weakObjectsHashTable];
+            objc_setAssociatedObject(application, &mouseApplicationEditorKey, owner, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        }
+        [owner removeAllObjects];
+        [owner addObject:editor];
+    }
+    if (windowWrapper && selector == @selector(mouseMoved:)) {
+        [windowWrapper sendMouseEvent:event];
+    } else {
+        Method original = class_getInstanceMethod(class_getSuperclass(object_getClass(view)), selector);
+        if (original) reinterpret_cast<void (*)(id, SEL, NSEvent*)>(method_getImplementation(original))(view, selector, event);
+    }
+    NSPoint point = [editor convertPoint:event.locationInWindow fromView:nil];
+    objc_setAssociatedObject(editor, &mouseLocationKey, [NSValue valueWithPoint:point], OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    updateNativeButtonHover(windowWrapper, editor, point);
+    if (editor) invalidateNativeEditor(editor);
+}
+
+static void hostedMouseBoundary(NSView* view, SEL selector, NSEvent* event) {
+    NSPoint location = selector == @selector(mouseExited:)
+        ? [view convertPoint:NSMakePoint(-1, -1) toView:nil] : event.locationInWindow;
+    NSEvent* move = [NSEvent mouseEventWithType:NSEventTypeMouseMoved location:location
+        modifierFlags:event.modifierFlags timestamp:event.timestamp windowNumber:event.windowNumber
+        context:nil eventNumber:event.eventNumber clickCount:0 pressure:0];
+    hostedMouseEvent(view, @selector(mouseMoved:), move);
+}
+
+static void installMouseHandler(NSView* view, NSHashTable* reference, NSHashTable<NSView*>* views, bool root = true) {
+    for (NSView* child in view.subviews) installMouseHandler(child, reference, views, false);
+    Class nativeClass = NSClassFromString(@"D1NSView");
+    if (!nativeClass || ![view isKindOfClass:nativeClass] ||
+        objc_getAssociatedObject(view, &mouseWindowKey)) return;
+    Class original = object_getClass(view);
+    NSString* name = [@"FLBridgeMouse_" stringByAppendingString:NSStringFromClass(original)];
+    Class subclass = NSClassFromString(name);
+    if (!subclass) {
+        subclass = objc_allocateClassPair(original, name.UTF8String, 0);
+        if (!subclass) {
+            fprintf(stderr, "FloopHole: cannot install native editor mouse handler\n");
+            return;
+        }
+        class_addMethod(subclass, @selector(class), reinterpret_cast<IMP>(hostedNativeViewClass), "#@:");
+        for (SEL selector : {@selector(mouseMoved:), @selector(mouseDown:), @selector(mouseUp:),
+                             @selector(mouseDragged:), @selector(mouseEntered:), @selector(mouseExited:)}) {
+            Method method = class_getInstanceMethod(original, selector);
+            class_addMethod(subclass, selector,
+                reinterpret_cast<IMP>(selector == @selector(mouseEntered:) || selector == @selector(mouseExited:)
+                    ? hostedMouseBoundary : hostedMouseEvent), method ? method_getTypeEncoding(method) : "v@:@");
+        }
+        objc_registerClassPair(subclass);
+    }
+    objc_setAssociatedObject(view, &mouseWindowKey, reference, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    object_setClass(view, subclass);
+    [views addObject:view];
+    if (root) {
+        NSTrackingArea* area = [[NSTrackingArea alloc] initWithRect:NSZeroRect
+            options:NSTrackingMouseMoved | NSTrackingMouseEnteredAndExited |
+                    NSTrackingActiveInActiveApp | NSTrackingInVisibleRect
+            owner:view userInfo:nil];
+        [view addTrackingArea:area];
+        objc_setAssociatedObject(view, &mouseTrackingKey, area, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+}
 
 static void hostedScrollWheel(NSView* view, SEL selector, NSEvent* event) {
     NSHashTable* windowReference = objc_getAssociatedObject(view, &scrollWindowKey);
@@ -1186,13 +1380,20 @@ bool FLPluginInstance::attachEditorToNSView(void* parentNSView, int& outWidth, i
 
     // DirectWave has a C++ audio ABI but embeds a Pascal/MacVCL editor.
     const bool macVclEditor = m_isPascalABI || m_pluginName == "DirectWave";
+    const bool hybridEditor = m_pluginName == "Newtone" || m_pluginName == "Newtime";
     intptr_t editorHandle = macVclEditor ? (((intptr_t)parentNSView) | 1) : (intptr_t)parentNSView;
     @autoreleasepool {
-        if (m_pluginName == "Newtone") {
+        if (hybridEditor) {
             installVstWindowSafeHandlers();
             void* form = *(void**)((uint8_t*)m_plug + 0xc8);
             void* mainPanel = form ? *(void**)((uint8_t*)form + 0x8e0) : nullptr;
-            if (!mainPanel) return false;
+            if (!mainPanel) {
+                if (previousParent) CFRelease(previousParent);
+                fprintf(stderr, "FloopHole: %s native editor panel is unavailable\n", m_pluginName.c_str());
+                return false;
+            }
+            NSHashTable<NSWindow*>* previousWindows = [NSHashTable weakObjectsHashTable];
+            for (NSWindow* window in NSApp.windows) [previousWindows addObject:window];
             NSView* topRoot = parentView;
             while (!topRoot.window && topRoot.superview) topRoot = topRoot.superview;
             NSWindow* stagingWindow = nil;
@@ -1211,33 +1412,37 @@ bool FLPluginInstance::attachEditorToNSView(void* parentNSView, int& outWidth, i
             setParentWindow(mainPanel, (intptr_t)parentNSView);
             editorHandle = *(intptr_t*)((uint8_t*)mainPanel + 0x618);
             if (!editorHandle) {
+                setParentWindow(mainPanel, 0);
                 if (stagingWindow) {
                     [topRoot removeFromSuperview];
                     [stagingWindow close];
                     objc_setAssociatedObject(parentView, &stagingWindowKey, nil,
                                              OBJC_ASSOCIATION_RETAIN_NONATOMIC);
                 }
+                if (previousParent) CFRelease(previousParent);
+                fprintf(stderr, "FloopHole: %s native editor parent handle is unavailable\n", m_pluginName.c_str());
                 return false;
             }
             synchronizeEditorWindow(parentView);
             m_fnDispatcher(m_plug, FPD_ShowEditor, 0, editorHandle);
-            if (void* audioObj = *(void**)((uint8_t*)m_plug + 0x200)) {
-                auto getEngineCount = reinterpret_cast<int32_t (*)(void*)>(
-                    reinterpret_cast<uintptr_t>(m_fnDispatcher) - 0x679b0 + 0x6d690);
-                auto getEngine = reinterpret_cast<void* (*)(void*, int32_t)>(
-                    reinterpret_cast<uintptr_t>(m_fnDispatcher) - 0x679b0 + 0x6d6b0);
-                NSHashTable<NSWindow*>* vstWindows = [NSHashTable weakObjectsHashTable];
-                const int32_t count = getEngineCount(audioObj);
-                for (int32_t i = 0; i < count; ++i) {
-                    void* engine = getEngine(audioObj, i);
-                    NSView* content = engine ? (__bridge NSView*)(*(void**)((uint8_t*)engine + 0x50)) : nil;
-                    if (NSWindow* vstWindow = content.window) {
-                        [vstWindows addObject:vstWindow];
-                    }
+            NSHashTable<NSWindow*>* vstWindows = [NSHashTable weakObjectsHashTable];
+            Class vstWindowClass = NSClassFromString(@"VstWindow");
+            for (NSWindow* window in NSApp.windows) {
+                NSHashTable<NSView*>* owners = objc_getAssociatedObject(window, &vstWindowOwnerKey);
+                NSView* owner = owners.anyObject;
+                if (vstWindowClass && [window isKindOfClass:vstWindowClass] &&
+                    ((!owner && (![previousWindows containsObject:window] ||
+                                  window.parentWindow == parentView.window)) ||
+                     owner == parentView || (previousParent && owner == (__bridge NSView*)previousParent) ||
+                     [window.contentView isDescendantOf:parentView])) {
+                    [vstWindows addObject:window];
+                    NSHashTable<NSView*>* ownership = [NSHashTable weakObjectsHashTable];
+                    [ownership addObject:parentView];
+                    objc_setAssociatedObject(window, &vstWindowOwnerKey, ownership, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
                 }
-                objc_setAssociatedObject(parentView, &vstWindowsKey, vstWindows,
-                                         OBJC_ASSOCIATION_RETAIN_NONATOMIC);
             }
+            objc_setAssociatedObject(parentView, &vstWindowsKey, vstWindows,
+                                     OBJC_ASSOCIATION_RETAIN_NONATOMIC);
             if (stagingWindow) {
                 // Keep topRoot in stagingWindow until the DAW moves its parent NSView into the host NSWindow;
                 // [NSWindow.contentView addSubview:...] automatically reparents topRoot out of stagingWindow.
@@ -1262,7 +1467,7 @@ bool FLPluginInstance::attachEditorToNSView(void* parentNSView, int& outWidth, i
             outHeight = (int)std::lround(f.size.height);
             [sv setFrameOrigin:NSMakePoint(0, 0)];
             if (m_pluginName == "Harmor" || m_pluginName == "Fruity Scratcher" ||
-                m_pluginName == "3x Osc" || m_pluginName == "Newtone" || m_pluginName == "Edison") {
+                m_pluginName == "3x Osc" || hybridEditor || m_pluginName == "Edison") {
                 NSHashTable<NSView*>* views = [NSHashTable weakObjectsHashTable];
                 objc_setAssociatedObject(parentView, &fileDropViewsKey, views, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
                 installFileDropHandler(sv, this, views);
@@ -1305,6 +1510,24 @@ bool FLPluginInstance::attachEditorToNSView(void* parentNSView, int& outWidth, i
         }
         if (views.count == 0) fprintf(stderr, "FloopHole: FLEX native scroll-wheel routing is unavailable\n");
     }
+    if (m_pluginName == "Edison" && editorView) {
+        NSHashTable<NSView*>* views = [NSHashTable weakObjectsHashTable];
+        objc_setAssociatedObject(parentView, &mouseViewsKey, views, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        for (NSWindow* backing in NSApp.windows) {
+            if (hostedEditorForWindow(backing) != editorView ||
+                ![backing.delegate respondsToSelector:@selector(sendMouseEvent:)]) continue;
+            if (!nativeInputState(backing.delegate)) {
+                fprintf(stderr, "FloopHole: Edison native hover-state service is unavailable\n");
+                break;
+            }
+            NSHashTable* reference = [NSHashTable weakObjectsHashTable];
+            [reference addObject:backing.delegate];
+            installMouseHandler(editorView, reference, views);
+            break;
+        }
+        if (views.count == 0)
+            fprintf(stderr, "FloopHole: Edison native mouse routing is unavailable\n");
+    }
     if (m_pluginName == "Sytrus" && editorView) {
         // Sytrus needs a real size-change pass to initialize its hosted panel layout.
         const NSSize size = editorView.frame.size;
@@ -1337,6 +1560,22 @@ bool FLPluginInstance::resizeEditor(int& width, int& height) {
 void FLPluginInstance::detachEditor() {
     std::lock_guard<std::recursive_mutex> lock(m_mutex);
     if (!m_plug || !m_fnDispatcher || !m_editorOpen) return;
+    NSHashTable<NSView*>* mouseViews = objc_getAssociatedObject((__bridge NSView*)m_parentNSView, &mouseViewsKey);
+    for (NSView* view in mouseViews.allObjects) {
+        setNativeButtonHover(view, nullptr);
+        NSHashTable* reference = objc_getAssociatedObject(view, &mouseWindowKey);
+        id application = nil;
+        nativeInputState(reference.anyObject, &application);
+        NSHashTable<NSView*>* owner = objc_getAssociatedObject(application, &mouseApplicationEditorKey);
+        if (owner.anyObject == view)
+            objc_setAssociatedObject(application, &mouseApplicationEditorKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        if (NSTrackingArea* area = objc_getAssociatedObject(view, &mouseTrackingKey)) [view removeTrackingArea:area];
+        object_setClass(view, class_getSuperclass(object_getClass(view)));
+        objc_setAssociatedObject(view, &mouseTrackingKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        objc_setAssociatedObject(view, &mouseWindowKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        objc_setAssociatedObject(view, &mouseLocationKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+    objc_setAssociatedObject((__bridge NSView*)m_parentNSView, &mouseViewsKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     NSHashTable<NSView*>* scrollViews = objc_getAssociatedObject((__bridge NSView*)m_parentNSView, &scrollViewsKey);
     for (NSView* view in scrollViews.allObjects) {
         object_setClass(view, class_getSuperclass(object_getClass(view)));
@@ -1354,10 +1593,13 @@ void FLPluginInstance::detachEditor() {
         }
     }
     @autoreleasepool {
-        if (m_pluginName == "Newtone" && m_parentNSView) {
+        const bool hybridEditor = m_pluginName == "Newtone" || m_pluginName == "Newtime";
+        if (hybridEditor && m_parentNSView) {
             NSView* parentView = (__bridge NSView*)m_parentNSView;
             NSHashTable<NSWindow*>* vstWindows = objc_getAssociatedObject(parentView, &vstWindowsKey);
             for (NSWindow* vstWindow in vstWindows.allObjects) {
+                objc_setAssociatedObject(vstWindow, &vstWindowOffsetKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+                objc_setAssociatedObject(vstWindow, &vstWindowHostOriginKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
                 if (vstWindow.parentWindow) [vstWindow.parentWindow removeChildWindow:vstWindow];
                 if ([vstWindow respondsToSelector:@selector(setParent:)]) [vstWindow setParent:nil];
             }
@@ -1365,7 +1607,7 @@ void FLPluginInstance::detachEditor() {
                                      OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         }
         m_fnDispatcher(m_plug, FPD_ShowEditor, 0, 0);
-        if (m_pluginName == "Newtone") {
+        if (hybridEditor) {
             void* form = *(void**)((uint8_t*)m_plug + 0xc8);
             void* mainPanel = form ? *(void**)((uint8_t*)form + 0x8e0) : nullptr;
             if (mainPanel) {
@@ -1394,7 +1636,16 @@ void FLPluginInstance::idleEditor() {
     }
     if (m_parentNSView) {
         NSView* parentView = (__bridge NSView*)m_parentNSView;
+        NSHashTable<NSWindow*>* vstWindows = objc_getAssociatedObject(parentView, &vstWindowsKey);
+        for (NSWindow* window in vstWindows.allObjects) {
+            if (!window.parentWindow || !objc_getAssociatedObject(window, &vstWindowOffsetKey)) continue;
+            objc_setAssociatedObject(window, &vstWindowHostOriginKey,
+                [NSValue valueWithPoint:window.parentWindow.frame.origin], OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        }
         if (NSView* sv = nativeEditorView(parentView)) {
+            NSHashTable* reference = objc_getAssociatedObject(sv, &mouseWindowKey);
+            NSValue* point = objc_getAssociatedObject(sv, &mouseLocationKey);
+            if (point) updateNativeButtonHover(reference.anyObject, sv, point.pointValue);
             NSRect f = [sv frame];
             int w = (int)std::lround(f.size.width);
             int h = (int)std::lround(f.size.height);

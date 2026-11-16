@@ -285,6 +285,9 @@ std::string FLPluginScanner::getDataPath(uint32_t id, uint8_t index) const {
         case FLData_Scores: path = root / (user ? "Presets/Scores" : "Data/Patches/Scores"); break;
         case FLData_SystemData: path = root / (user ? "Settings" : "System"); break;
         case FLData_Internet: path = root / (user ? "Settings/Internet" : "System/Internet"); break;
+#ifdef __APPLE__
+        case FLData_AudioScripts: path = root / (user ? "Settings/Audio scripts" : "System/Config/Audio scripts"); break;
+#endif
         case 1039: path = root / (user ? "Settings/Languages" : "System/Languages"); break;
         default: {
             static std::mutex warningMutex;

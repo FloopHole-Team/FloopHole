@@ -619,6 +619,20 @@ static void testDataPathsAndBanks(const fs::path& directory) {
     writeFixture(factoryPack);
     CHECK(fs::is_regular_file(fs::u8path(scanner.getFlexDataPath(PI_Factory)) / "Packs" / "Factory.flexpack"));
     CHECK(!manager.getPath(9999, PI_User, buffer) && !*buffer);
+#ifdef __APPLE__
+    CHECK(manager.getPath(FLData_AudioScripts, PI_User, buffer));
+    CHECK(fs::u8path(buffer).lexically_normal() ==
+          (fs::u8path(scanner.getUserDataPath()) / "Settings/Audio scripts" / "").lexically_normal());
+    CHECK(manager.getPath(FLData_AudioScripts, PI_Factory, buffer));
+    CHECK(fs::u8path(buffer).lexically_normal() ==
+          (fs::u8path(scanner.getFLRootPath()) / "System/Config/Audio scripts" / "").lexically_normal());
+    writeFixture(fs::u8path(buffer) / "FX/Test.pyscript");
+    TestPathList scripts;
+    std::string scriptFolder = "FX", scriptExtension = ".pyscript";
+    CHECK(manager.scanDir(FLData_AudioScripts, scriptFolder.data(), scriptExtension.data(),
+                          &scripts, 2, 1u << PI_Factory, nullptr));
+    CHECK(scripts.files == std::vector<std::string>{"Test.pyscript"});
+#endif
 
     for (const auto& bank : std::vector<std::pair<std::string, std::string>>{
              {"Toxic Biohazard", ".tbio"}, {"Morphine", ".mrp"}, {"GMS", ".gmsynth"},
