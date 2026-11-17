@@ -84,6 +84,27 @@ mkdir -p "$HOME/Library/Audio/Plug-Ins/VST3"
 ditto build/VST3/FloopHole.vst3 "$HOME/Library/Audio/Plug-Ins/VST3/FloopHole.vst3"
 ```
 
+Quit your DAW before replacing an installed bundle, then restart it. An already
+loaded plugin continues running the old code even if the bundle on disk changes.
+
+### macOS native editor checks
+
+The native editor container must follow the non-overlapping toolbar/footer views:
+MacVCL's fallback view search otherwise discards the form it already found.
+This ordering preserves native control lookup and hover help across instruments
+and effects.
+
+With a local FL Studio installation, run the loaded-VST regressions:
+
+```sh
+cmake --build build --target FloopHole test_vst3 --parallel
+build/test_vst3 --native-hover-help
+build/test_vst3 --edison-vst-poll
+```
+
+These check visible hover-help text and native Edison hover/leave state using
+the VST's real idle timer. They do not replace checking the editor in the DAW.
+
 ## Build on Windows
 
 Requirements: Git for Windows, CMake 3.20+, and Visual Studio 2022 (or Build Tools)

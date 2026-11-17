@@ -47,6 +47,13 @@
 @end
 
 static NSPoint testMouseLocation;
+static NSWindow* testCursorWindow;
+@interface NSApplication (FLBridgeTestActivation)
+- (BOOL)flBridgeTestIsActive;
+@end
+@implementation NSApplication (FLBridgeTestActivation)
+- (BOOL)flBridgeTestIsActive { return YES; }
+@end
 static double testNativeMouseScale = 1;
 static void testNativeCursorPosition(NSPoint* point) {
     *point = NSMakePoint(testMouseLocation.x * testNativeMouseScale,
@@ -61,10 +68,14 @@ static void testNativeCursorPosition(NSPoint* point) {
 
 @interface NSWindow (FLBridgeTestMouseLocation)
 - (NSPoint)flBridgeTestMouseLocationOutsideOfEventStream;
++ (NSInteger)flBridgeTestWindowNumberAtPoint:(NSPoint)point belowWindowWithWindowNumber:(NSInteger)number;
 @end
 @implementation NSWindow (FLBridgeTestMouseLocation)
 - (NSPoint)flBridgeTestMouseLocationOutsideOfEventStream {
     return [self convertPointFromScreen:testMouseLocation];
+}
++ (NSInteger)flBridgeTestWindowNumberAtPoint:(NSPoint)point belowWindowWithWindowNumber:(NSInteger)number {
+    return testCursorWindow.windowNumber;
 }
 @end
 @interface NSObject (FLBridgeTestNativeKeyRouting)
@@ -83,6 +94,18 @@ static NSURL* testOpenFile;
 - (NSArray<NSURL*>*)flBridgeTestURLs { return @[testOpenFile]; }
 - (NSURL*)flBridgeTestURL { return testOpenFile; }
 @end
+
+static void swapTestFilePanel() {
+    for (auto selectors : {
+        std::make_pair(@selector(runModal), @selector(flBridgeTestRunModal)),
+        std::make_pair(@selector(URLs), @selector(flBridgeTestURLs)),
+        std::make_pair(@selector(URL), @selector(flBridgeTestURL))}) {
+        Method original = class_getInstanceMethod(NSOpenPanel.class, selectors.first);
+        class_addMethod(NSOpenPanel.class, selectors.first, method_getImplementation(original), method_getTypeEncoding(original));
+        method_exchangeImplementations(class_getInstanceMethod(NSOpenPanel.class, selectors.first),
+            class_getInstanceMethod(NSOpenPanel.class, selectors.second));
+    }
+}
 
 static NSString* testPreferencesDomain = nil;
 @interface NSUserDefaults (FLBridgeTestPreferences)
@@ -220,9 +243,9 @@ struct FLPluginInstanceTestAccess {
         CHECK(name[0] == 9 && memcmp(name + 1, "TQuickBtn", 9) == 0 && table[0] >= 0x5a0);
         return {button, table[0]};
     }
-    static void** nativeCursorBinding(FLPluginInstance& instance) {
+    static void** nativeCursorBinding(void* imageAddress) {
         Dl_info image{};
-        CHECK(dladdr(reinterpret_cast<void*>(instance.m_fnDispatcher), &image));
+        CHECK(dladdr(imageAddress, &image));
         auto* header = static_cast<const mach_header_64*>(image.dli_fbase);
         void* function = dlsym(RTLD_DEFAULT, "MVScreenGetCursorPos");
         CHECK(function && header->magic == MH_MAGIC_64);
@@ -238,6 +261,9 @@ struct FLPluginInstanceTestAccess {
         }
         CHECK(binding);
         return binding;
+    }
+    static void** nativeCursorBinding(FLPluginInstance& instance) {
+        return nativeCursorBinding(reinterpret_cast<void*>(instance.m_fnDispatcher));
     }
 };
 }
@@ -2355,6 +2381,243 @@ static void verifyTransportUtilities(const char* screenshotDirectory) {
     }
 }
 
+static void verifyNativeVSTHoverHelp() {
+    void* bundle = dlopen("./build/VST3/FloopHole.vst3/Contents/MacOS/FloopHole", RTLD_NOW);
+    CHECK(bundle);
+    auto entry = reinterpret_cast<BundleEntryFn>(dlsym(bundle, "bundleEntry"));
+    auto factoryFn = reinterpret_cast<GetPluginFactoryFn>(dlsym(bundle, "GetPluginFactory"));
+    auto bundleExit = reinterpret_cast<BundleExitFn>(dlsym(bundle, "bundleExit"));
+    CHECK(entry && factoryFn && bundleExit && entry(nullptr));
+    IPluginFactory* factory = factoryFn();
+    struct Case {
+        const char* plugin;
+        NSPoint point;
+        const char* hint;
+    };
+    const Case cases[] = {
+        {"BooBass", NSMakePoint(60, 75), "Bass"},
+        {"Harmor", NSMakePoint(350, 350), "Current part"},
+        {"Fruity Fast LP", NSMakePoint(25, 27.5), "Cutoff"},
+        {"Fruity Fast LP", NSMakePoint(175, 27.5), "Resonance"}
+    };
+    for (const auto& test : cases) {
+        PClassInfo info = nativeClassInfo(factory, test.plugin);
+        IComponent* component = nullptr;
+        CHECK(factory->createInstance(info.cid, IComponent::iid, reinterpret_cast<void**>(&component)) == kResultOk);
+        CHECK(component->initialize(nullptr) == kResultOk);
+        CHECK(component->setActive(true) == kResultOk);
+        IEditController* controller = nullptr;
+        CHECK(component->queryInterface(IEditController::iid, reinterpret_cast<void**>(&controller)) == kResultOk);
+        IPlugView* view = controller->createView(ViewType::kEditor);
+        TestPlugFrame frame;
+        CHECK(view && view->setFrame(&frame) == kResultOk);
+        for (int cycle = 0; cycle < 2; ++cycle) {
+            NSWindow* window = [[NSWindow alloc] initWithContentRect:NSMakeRect(120, 120, 1200, 900)
+                styleMask:NSWindowStyleMaskTitled backing:NSBackingStoreBuffered defer:NO];
+            window.releasedWhenClosed = NO;
+            CHECK(view->attached((__bridge void*)window.contentView, kPlatformTypeNSView) == kResultOk);
+            NSView* editor = findNativeEditor(window.contentView);
+            NSControl* picker = findPresetPicker(window.contentView);
+            CHECK(editor && picker);
+            NSView* volume = findVolumeKnob(window.contentView);
+            NSView* grip = findResizeGrip(window.contentView);
+            CHECK(volume && grip);
+            for (NSView* control in @[picker, volume, grip]) {
+                if (control.hidden) continue;
+                NSPoint center = [control convertPoint:NSMakePoint(NSMidX(control.bounds), NSMidY(control.bounds))
+                    toView:window.contentView];
+                NSView* hit = [window.contentView hitTest:center];
+                CHECK(hit == control || [hit isDescendantOf:control]);
+            }
+            NSView* label = picker.superview.subviews[5];
+            CHECK([label isKindOfClass:NSTextField.class]);
+            NSTextField* hint = (NSTextField*)label;
+            ViewRect size{};
+            CHECK(view->getSize(&size) == kResultOk);
+            [window setContentSize:NSMakeSize(size.getWidth(), size.getHeight())];
+            [window makeKeyAndOrderFront:nil];
+            id wrapper = object_getIvar(editor, class_getInstanceVariable(NSClassFromString(@"D1NSView"), "owner"));
+            Ivar handlerIvar = class_getInstanceVariable(NSClassFromString(@"MVObject"), "fEventHandler");
+            CHECK(wrapper && handlerIvar);
+            void* handler = nullptr;
+            memcpy(&handler, static_cast<const uint8_t*>((__bridge const void*)wrapper) + ivar_getOffset(handlerIvar),
+                sizeof(handler));
+            void** cursorBinding = flbr::FLPluginInstanceTestAccess::nativeCursorBinding(handler);
+            void* savedCursorBinding = *cursorBinding;
+            *cursorBinding = reinterpret_cast<void*>(testNativeCursorPosition);
+            testNativeMouseScale = window.backingScaleFactor;
+            Method mouse = class_getClassMethod(NSEvent.class, @selector(mouseLocation));
+            Method fakeMouse = class_getClassMethod(NSEvent.class, @selector(flBridgeTestMouseLocation));
+            Method active = class_getInstanceMethod(NSApplication.class, @selector(isActive));
+            Method fakeActive = class_getInstanceMethod(NSApplication.class, @selector(flBridgeTestIsActive));
+            Method top = class_getClassMethod(NSWindow.class, @selector(windowNumberAtPoint:belowWindowWithWindowNumber:));
+            Method fakeTop = class_getClassMethod(NSWindow.class, @selector(flBridgeTestWindowNumberAtPoint:belowWindowWithWindowNumber:));
+            method_exchangeImplementations(mouse, fakeMouse);
+            method_exchangeImplementations(active, fakeActive);
+            method_exchangeImplementations(top, fakeTop);
+            testCursorWindow = window;
+            NSPoint point = test.point;
+            if (!editor.isFlipped) point.y = editor.bounds.size.height - point.y;
+            testMouseLocation = [window convertPointToScreen:NSMakePoint(-100, -100)];
+            [NSRunLoop.currentRunLoop runUntilDate:[NSDate dateWithTimeIntervalSinceNow:0.1]];
+            hint.stringValue = @"";
+            testMouseLocation = [window convertPointToScreen:[editor convertPoint:point toView:nil]];
+            NSString* expected = [NSString stringWithUTF8String:test.hint];
+            NSDate* deadline = [NSDate dateWithTimeIntervalSinceNow:2];
+            while (![hint.stringValue localizedCaseInsensitiveContainsString:expected] && deadline.timeIntervalSinceNow > 0)
+                [NSRunLoop.currentRunLoop runUntilDate:[NSDate dateWithTimeIntervalSinceNow:0.02]];
+            fprintf(stderr, "%s hover cycle %d: '%s'\n", test.plugin, cycle, hint.stringValue.UTF8String);
+            CHECK([hint.stringValue localizedCaseInsensitiveContainsString:expected]);
+            CHECK([hint.toolTip isEqualToString:hint.stringValue]);
+            *cursorBinding = savedCursorBinding;
+            method_exchangeImplementations(top, fakeTop);
+            method_exchangeImplementations(active, fakeActive);
+            method_exchangeImplementations(mouse, fakeMouse);
+            testCursorWindow = nil;
+            CHECK(view->removed() == kResultOk);
+            [window close];
+        }
+        view->release();
+        controller->release();
+        CHECK(component->setActive(false) == kResultOk);
+        CHECK(component->terminate() == kResultOk);
+        component->release();
+    }
+    factory->release();
+    CHECK(bundleExit());
+    CHECK(dlclose(bundle) == 0);
+    fprintf(stderr, "Loaded VST3 native knob/button hover help and reopening passed\n");
+}
+
+static void verifyEdisonVSTPolling() {
+    void* bundle = dlopen("./build/VST3/FloopHole.vst3/Contents/MacOS/FloopHole", RTLD_NOW);
+    CHECK(bundle);
+    auto entry = reinterpret_cast<BundleEntryFn>(dlsym(bundle, "bundleEntry"));
+    auto factoryFn = reinterpret_cast<GetPluginFactoryFn>(dlsym(bundle, "GetPluginFactory"));
+    auto bundleExit = reinterpret_cast<BundleExitFn>(dlsym(bundle, "bundleExit"));
+    CHECK(entry && factoryFn && bundleExit && entry(nullptr));
+    IPluginFactory* factory = factoryFn();
+    PClassInfo info = nativeClassInfo(factory, "Edison");
+    IComponent* component = nullptr;
+    CHECK(factory->createInstance(info.cid, IComponent::iid, reinterpret_cast<void**>(&component)) == kResultOk);
+    CHECK(component->initialize(nullptr) == kResultOk);
+    CHECK(component->setActive(true) == kResultOk);
+    IEditController* controller = nullptr;
+    CHECK(component->queryInterface(IEditController::iid, reinterpret_cast<void**>(&controller)) == kResultOk);
+    IPlugView* view = controller->createView(ViewType::kEditor);
+    TestPlugFrame frame;
+    CHECK(view && view->setFrame(&frame) == kResultOk);
+    NSWindow* window = [[NSWindow alloc] initWithContentRect:NSMakeRect(120, 120, 1200, 900)
+        styleMask:NSWindowStyleMaskTitled backing:NSBackingStoreBuffered defer:NO];
+    window.releasedWhenClosed = NO;
+    CHECK(view->attached((__bridge void*)window.contentView, kPlatformTypeNSView) == kResultOk);
+    NSView* editor = findNativeEditor(window.contentView);
+    CHECK(editor);
+    ViewRect size{};
+    CHECK(view->getSize(&size) == kResultOk);
+    [window setContentSize:NSMakeSize(size.getWidth(), size.getHeight())];
+    [window makeKeyAndOrderFront:nil];
+    [NSRunLoop.currentRunLoop runUntilDate:[NSDate dateWithTimeIntervalSinceNow:0.2]];
+    CHECK(flbr::FLPluginScanner::getInstance().initialize());
+    flbr::FLPathManager paths;
+    char sample[flbr::PathBufferLength]{}, folder[] = "", extension[] = ".wav";
+    paths.randomDirFile(flbr::FLData_Packs, folder, extension, 1u << 3, 1u << flbr::PI_Factory, 0, sample);
+    CHECK(*sample);
+    testOpenFile = [NSURL fileURLWithPath:[NSString stringWithUTF8String:sample]];
+    swapTestFilePanel();
+    NSPoint wave = NSMakePoint(editor.frame.size.width / 2, editor.frame.size.height / 2);
+    NSView* target = [editor hitTest:[editor convertPoint:wave toView:editor.superview]] ?: editor;
+    for (NSEventType type : {NSEventTypeLeftMouseDown, NSEventTypeLeftMouseUp}) {
+        NSEvent* event = [NSEvent mouseEventWithType:type location:[editor convertPoint:wave toView:nil]
+            modifierFlags:0 timestamp:NSProcessInfo.processInfo.systemUptime windowNumber:window.windowNumber
+            context:nil eventNumber:1 clickCount:1 pressure:type == NSEventTypeLeftMouseDown ? 1 : 0];
+        if (type == NSEventTypeLeftMouseDown) [target mouseDown:event];
+        else [target mouseUp:event];
+    }
+    swapTestFilePanel();
+    testOpenFile = nil;
+    id nativeWindow = object_getIvar(editor, class_getInstanceVariable(NSClassFromString(@"D1NSView"), "owner"));
+    Ivar handlerIvar = class_getInstanceVariable(NSClassFromString(@"MVObject"), "fEventHandler");
+    CHECK(handlerIvar);
+    void* handler = nullptr;
+    memcpy(&handler, static_cast<const uint8_t*>((__bridge const void*)nativeWindow) + ivar_getOffset(handlerIvar),
+           sizeof(handler));
+    void** cursorBinding = flbr::FLPluginInstanceTestAccess::nativeCursorBinding(handler);
+    void* savedCursorBinding = *cursorBinding;
+    *cursorBinding = reinterpret_cast<void*>(testNativeCursorPosition);
+    testNativeMouseScale = window.backingScaleFactor;
+    Method mouse = class_getClassMethod(NSEvent.class, @selector(mouseLocation));
+    Method fakeMouse = class_getClassMethod(NSEvent.class, @selector(flBridgeTestMouseLocation));
+    Method active = class_getInstanceMethod(NSApplication.class, @selector(isActive));
+    Method fakeActive = class_getInstanceMethod(NSApplication.class, @selector(flBridgeTestIsActive));
+    Method top = class_getClassMethod(NSWindow.class, @selector(windowNumberAtPoint:belowWindowWithWindowNumber:));
+    Method fakeTop = class_getClassMethod(NSWindow.class, @selector(flBridgeTestWindowNumberAtPoint:belowWindowWithWindowNumber:));
+    method_exchangeImplementations(mouse, fakeMouse);
+    method_exchangeImplementations(active, fakeActive);
+    method_exchangeImplementations(top, fakeTop);
+    testCursorWindow = window;
+    const NSPoint run = NSMakePoint(editor.frame.size.width * 651.0 / 957.0,
+                                   editor.frame.size.height * 55.0 / 628.0);
+    testMouseLocation = [window convertPointToScreen:[editor convertPoint:run toView:nil]];
+    [NSRunLoop.currentRunLoop runUntilDate:[NSDate dateWithTimeIntervalSinceNow:0.25]];
+    id application = object_getIvar([nativeWindow window],
+        class_getInstanceVariable(NSClassFromString(@"CustomWindow"), "MVApp"));
+    auto getState = reinterpret_cast<uint8_t*(*)(void*)>(dlsym(RTLD_DEFAULT, "MVApplicationGetGlobalState"));
+    CHECK(getState && application);
+    uint8_t* button = nullptr;
+    memcpy(&button, getState((__bridge void*)application) + 0x48, sizeof(button));
+    CHECK(button);
+    auto* table = *reinterpret_cast<uintptr_t**>(button);
+    const auto* name = reinterpret_cast<const uint8_t*>(table[3]);
+    CHECK(name[0] == 9 && memcmp(name + 1, "TQuickBtn", 9) == 0 && table[0] > 0x54b);
+    CHECK(button[0x54b] == 1);
+    testMouseLocation = [window convertPointToScreen:[editor convertPoint:NSMakePoint(-10, -10) toView:nil]];
+    [NSRunLoop.currentRunLoop runUntilDate:[NSDate dateWithTimeIntervalSinceNow:0.25]];
+    CHECK(button[0x54b] == 0);
+    NSControl* picker = findPresetPicker(window.contentView);
+    NSView* grip = findResizeGrip(window.contentView);
+    CHECK(picker && grip && !grip.hidden);
+    for (NSView* control in @[picker, grip]) {
+        const NSPoint center = [control convertPoint:NSMakePoint(NSMidX(control.bounds), NSMidY(control.bounds))
+            toView:window.contentView];
+        NSView* hit = [window.contentView hitTest:center];
+        CHECK(hit == control || [hit isDescendantOf:control]);
+    }
+
+    const NSPoint fade = NSMakePoint(editor.frame.size.width * 600.0 / 957.0, run.y);
+    testMouseLocation = [window convertPointToScreen:[editor convertPoint:fade toView:nil]];
+    [NSRunLoop.currentRunLoop runUntilDate:[NSDate dateWithTimeIntervalSinceNow:0.15]];
+    uint8_t* fadeButton = nullptr;
+    memcpy(&fadeButton, getState((__bridge void*)application) + 0x48, sizeof(fadeButton));
+    CHECK(fadeButton && fadeButton != button);
+    table = *reinterpret_cast<uintptr_t**>(fadeButton);
+    name = reinterpret_cast<const uint8_t*>(table[3]);
+    CHECK(name[0] == 9 && memcmp(name + 1, "TQuickBtn", 9) == 0 && table[0] > 0x54b);
+    CHECK(fadeButton[0x549] == 0 && fadeButton[0x54b] == 1);
+    testMouseLocation = [window convertPointToScreen:[editor convertPoint:run toView:nil]];
+    [NSRunLoop.currentRunLoop runUntilDate:[NSDate dateWithTimeIntervalSinceNow:0.15]];
+    CHECK(fadeButton[0x54b] == 0 && button[0x54b] == 1);
+    testMouseLocation = [window convertPointToScreen:[editor convertPoint:NSMakePoint(-10, -10) toView:nil]];
+    [NSRunLoop.currentRunLoop runUntilDate:[NSDate dateWithTimeIntervalSinceNow:0.15]];
+    CHECK(fadeButton[0x549] == 0 && fadeButton[0x54b] == 0);
+    CHECK(button[0x54b] == 0);
+    *cursorBinding = savedCursorBinding;
+    method_exchangeImplementations(top, fakeTop);
+    method_exchangeImplementations(active, fakeActive);
+    method_exchangeImplementations(mouse, fakeMouse);
+    testCursorWindow = nil;
+    CHECK(view->removed() == kResultOk);
+    view->release();
+    controller->release();
+    CHECK(component->terminate() == kResultOk);
+    component->release();
+    [window close];
+    factory->release();
+    CHECK(bundleExit());
+    dlclose(bundle);
+    fprintf(stderr, "Loaded Edison VST3 hover/leave, button transfer, and toolbar/footer hit testing passed\n");
+}
+
 static void verifyEdisonMouseInput() {
     flbr::FLPluginInstance instance;
     CHECK(instance.loadPluginByName("Edison"));
@@ -2576,7 +2839,7 @@ static void verifyEdisonMouseInput() {
     method_exchangeImplementations(windowMouseLocation, testWindowLocation);
     method_exchangeImplementations(mouseLocation, testLocation);
     [window close];
-    fprintf(stderr, "Edison native button hover/Down flags, inside/outside release, mouse exit, RUN/effect close and reopening passed\n");
+    fprintf(stderr, "Edison direct-call native button state checks passed (not Live-host validation)\n");
 }
 
 int main(int argc, char** argv) {
@@ -2586,6 +2849,14 @@ int main(int argc, char** argv) {
             return 0;
         }
         [NSApplication sharedApplication];
+        if (argc > 1 && strcmp(argv[1], "--native-hover-help") == 0) {
+            verifyNativeVSTHoverHelp();
+            return 0;
+        }
+        if (argc > 1 && strcmp(argv[1], "--edison-vst-poll") == 0) {
+            verifyEdisonVSTPolling();
+            return 0;
+        }
         if (argc > 1 && strcmp(argv[1], "--edison-input") == 0) {
             verifyEdisonMouseInput();
             return 0;

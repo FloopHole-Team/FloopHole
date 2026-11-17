@@ -494,7 +494,6 @@ tresult PLUGIN_API FLBridgePlugView::attached(void* parent, FIDString type) {
         m_rootContainerView.layer.backgroundColor = themeColor(ToolbarTheme::background).CGColor;
 
         m_pluginHostView = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, m_plugWidth, m_plugHeight)];
-        [m_rootContainerView addSubview:m_pluginHostView];
 
         m_toolbarView = [[NSView alloc] initWithFrame:NSMakeRect(0, m_plugHeight, m_plugWidth, kToolbarHeight)];
         [m_toolbarView setWantsLayer:YES];
@@ -551,6 +550,10 @@ tresult PLUGIN_API FLBridgePlugView::attached(void* parent, FIDString type) {
         m_resizeGrip.plugView = this;
         m_resizeGrip.toolTip = @"Resize native plugin";
         [m_rootContainerView addSubview:m_resizeGrip];
+
+        // MacVCL's form search loses a found form when it visits later
+        // non-native siblings. The toolbar/footer do not overlap this view.
+        [m_rootContainerView addSubview:m_pluginHostView];
 
         [parentNSView addSubview:m_rootContainerView];
 
