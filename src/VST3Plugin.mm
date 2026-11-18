@@ -1,4 +1,6 @@
 #import <Cocoa/Cocoa.h>
+#import <objc/runtime.h>
+#include <Carbon/Carbon.h>
 #include "FLPluginInstance.h"
 #include "FLPathManager.h"
 #include "FLPluginScanner.h"
@@ -10,6 +12,7 @@
 #include "pluginterfaces/base/ipluginbase.h"
 #include "pluginterfaces/base/ibstream.h"
 #include "pluginterfaces/base/ustring.h"
+#include "pluginterfaces/base/keycodes.h"
 #include "pluginterfaces/vst/ivstcomponent.h"
 #include "pluginterfaces/vst/ivstaudioprocessor.h"
 #include "pluginterfaces/vst/ivsteditcontroller.h"
@@ -26,11 +29,18 @@
 #include <algorithm>
 #include <cstring>
 #include <cmath>
+#include <set>
 
 using namespace Steinberg;
 using namespace Steinberg::Vst;
 
 namespace flbr {
+
+static char notebookTargetKey;
+static char notebookEventResultsKey;
+static void notebookPlatformKey(NSView* view, SEL selector, NSEvent* event);
+static BOOL notebookKeyEquivalent(NSView* view, SEL selector, NSEvent* event);
+static void notebookMouseUp(NSView* view, SEL selector, NSEvent* event);
 
 static constexpr int32 kToolbarHeight = 54;
 static constexpr int32 kLegacyAutomatableParams = 128;
@@ -82,7 +92,142 @@ class FLBridgePlugView;
 @property(nonatomic, strong) NSTrackingArea* hoverArea;
 @end
 
+@interface NSObject (FloopHoleNotebookWindow)
+- (NSWindow*)window;
+- (BOOL)sendKeyEvent:(NSEvent*)event;
+@end
+
 namespace flbr {
+
+static BOOL notebookAcceptsFirstResponder(id, SEL) { return YES; }
+
+static Class notebookNativeClass(id view, SEL) {
+    return class_getSuperclass(object_getClass(view));
+}
+
+static void notebookMouseDown(NSView* view, SEL selector, NSEvent* event) {
+    const BOOL focused = [view.window makeFirstResponder:view];
+    if (!focused)
+        fprintf(stderr, "FloopHole: could not focus native notebook editor\n");
+    Method original = class_getInstanceMethod(class_getSuperclass(object_getClass(view)), selector);
+    reinterpret_cast<void (*)(id, SEL, NSEvent*)>(method_getImplementation(original))(view, selector, event);
+}
+
+static void installNotebookFocus(NSView* view, NSHashTable<NSView*>* views, NSHashTable<FloopHoleToolbarTarget*>* target) {
+    for (NSView* child in view.subviews) installNotebookFocus(child, views, target);
+    Class native = NSClassFromString(@"D1NSView");
+    if (!native || ![view isKindOfClass:native]) return;
+    // MacVCL's custom writing surfaces otherwise leave Cocoa focus in the DAW.
+    Class original = object_getClass(view);
+    NSString* name = [@"FLBridgeNotebook_" stringByAppendingString:NSStringFromClass(original)];
+    Class subclass = NSClassFromString(name);
+    if (!subclass) {
+        subclass = objc_allocateClassPair(original, name.UTF8String, 0);
+        if (!subclass) {
+            fprintf(stderr, "FloopHole: could not install notebook keyboard focus\n");
+            return;
+        }
+        Method mouse = class_getInstanceMethod(original, @selector(mouseDown:));
+        class_addMethod(subclass, @selector(mouseDown:), reinterpret_cast<IMP>(notebookMouseDown), method_getTypeEncoding(mouse));
+        Method mouseUp = class_getInstanceMethod(original, @selector(mouseUp:));
+        class_addMethod(subclass, @selector(mouseUp:), reinterpret_cast<IMP>(notebookMouseUp), method_getTypeEncoding(mouseUp));
+        class_addMethod(subclass, @selector(acceptsFirstResponder), reinterpret_cast<IMP>(notebookAcceptsFirstResponder),
+            method_getTypeEncoding(class_getInstanceMethod(original, @selector(acceptsFirstResponder))));
+        class_addMethod(subclass, @selector(class), reinterpret_cast<IMP>(notebookNativeClass), "#@:");
+        // Live delivers Cocoa keys here without invoking the VST key callbacks.
+        for (SEL selector : {@selector(keyDown:), @selector(keyUp:), @selector(flagsChanged:)}) {
+            Method inherited = class_getInstanceMethod(original, selector);
+            if (inherited) class_addMethod(subclass, selector, reinterpret_cast<IMP>(notebookPlatformKey),
+                method_getTypeEncoding(inherited));
+        }
+        Method equivalent = class_getInstanceMethod(original, @selector(performKeyEquivalent:));
+        if (equivalent) class_addMethod(subclass, @selector(performKeyEquivalent:),
+            reinterpret_cast<IMP>(notebookKeyEquivalent), method_getTypeEncoding(equivalent));
+        objc_registerClassPair(subclass);
+    }
+    objc_setAssociatedObject(view, &notebookTargetKey, target, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    object_setClass(view, subclass);
+    [views addObject:view];
+}
+
+static bool notebookTextCommand(unichar character, bool navigation) {
+    if (character > 0 && character <= 26) character += u'a' - 1;
+    if (character >= u'A' && character <= u'Z') character += u'a' - u'A';
+    return navigation || character == u'a' || character == u'c' || character == u'v' ||
+        character == u'x' || character == u'z';
+}
+
+static NSEvent* notebookKeyEvent(NSWindow* window, bool down, char16 key, int16 keyCode, int16 modifiers) {
+    unichar character = key;
+    if (!character && keyCode >= 0 && keyCode <= VKEY_FIRST_ASCII + 'Z' - '0')
+        character = VirtualKeyCodeToChar(static_cast<uint8>(keyCode));
+    if ((modifiers & kCommandKey) && character > 0 && character <= 26) character += u'a' - 1;
+    const bool navigation = keyCode == KEY_BACK || keyCode == KEY_DELETE || keyCode == KEY_HOME ||
+        keyCode == KEY_END || (keyCode >= KEY_LEFT && keyCode <= KEY_DOWN);
+    if ((modifiers & kCommandKey) && !notebookTextCommand(character, navigation)) return nil;
+    unsigned short nativeCode = 0;
+    switch (keyCode) {
+        case KEY_BACK: character = NSDeleteCharacter; nativeCode = kVK_Delete; break;
+        case KEY_DELETE: character = NSDeleteFunctionKey; nativeCode = kVK_ForwardDelete; break;
+        case KEY_TAB: character = NSTabCharacter; nativeCode = kVK_Tab; break;
+        case KEY_RETURN: character = NSCarriageReturnCharacter; nativeCode = kVK_Return; break;
+        case KEY_ENTER: character = NSEnterCharacter; nativeCode = kVK_ANSI_KeypadEnter; break;
+        case KEY_ESCAPE: character = 0x1b; nativeCode = kVK_Escape; break;
+        case KEY_LEFT: character = NSLeftArrowFunctionKey; nativeCode = kVK_LeftArrow; break;
+        case KEY_RIGHT: character = NSRightArrowFunctionKey; nativeCode = kVK_RightArrow; break;
+        case KEY_UP: character = NSUpArrowFunctionKey; nativeCode = kVK_UpArrow; break;
+        case KEY_DOWN: character = NSDownArrowFunctionKey; nativeCode = kVK_DownArrow; break;
+        case KEY_HOME: character = NSHomeFunctionKey; nativeCode = kVK_Home; break;
+        case KEY_END: character = NSEndFunctionKey; nativeCode = kVK_End; break;
+        case KEY_PAGEUP: character = NSPageUpFunctionKey; nativeCode = kVK_PageUp; break;
+        case KEY_PAGEDOWN: character = NSPageDownFunctionKey; nativeCode = kVK_PageDown; break;
+        default: {
+            if (!character || character < 0x20) return nil;
+            static constexpr unsigned short letters[] = {
+                kVK_ANSI_A, kVK_ANSI_B, kVK_ANSI_C, kVK_ANSI_D, kVK_ANSI_E, kVK_ANSI_F, kVK_ANSI_G,
+                kVK_ANSI_H, kVK_ANSI_I, kVK_ANSI_J, kVK_ANSI_K, kVK_ANSI_L, kVK_ANSI_M, kVK_ANSI_N,
+                kVK_ANSI_O, kVK_ANSI_P, kVK_ANSI_Q, kVK_ANSI_R, kVK_ANSI_S, kVK_ANSI_T, kVK_ANSI_U,
+                kVK_ANSI_V, kVK_ANSI_W, kVK_ANSI_X, kVK_ANSI_Y, kVK_ANSI_Z
+            };
+            const unichar lower = character >= u'A' && character <= u'Z' ? character + u'a' - u'A' : character;
+            if (lower >= u'a' && lower <= u'z') nativeCode = letters[lower - u'a'];
+            else if (character == u' ') nativeCode = kVK_Space;
+            else {
+                static constexpr struct { char plain, shifted; unsigned short code; } keys[] = {
+                    {'0', ')', kVK_ANSI_0}, {'1', '!', kVK_ANSI_1}, {'2', '@', kVK_ANSI_2},
+                    {'3', '#', kVK_ANSI_3}, {'4', '$', kVK_ANSI_4}, {'5', '%', kVK_ANSI_5},
+                    {'6', '^', kVK_ANSI_6}, {'7', '&', kVK_ANSI_7}, {'8', '*', kVK_ANSI_8},
+                    {'9', '(', kVK_ANSI_9}, {'-', '_', kVK_ANSI_Minus}, {'=', '+', kVK_ANSI_Equal},
+                    {'[', '{', kVK_ANSI_LeftBracket}, {']', '}', kVK_ANSI_RightBracket},
+                    {'\\', '|', kVK_ANSI_Backslash}, {';', ':', kVK_ANSI_Semicolon},
+                    {'\'', '"', kVK_ANSI_Quote}, {',', '<', kVK_ANSI_Comma},
+                    {'.', '>', kVK_ANSI_Period}, {'/', '?', kVK_ANSI_Slash}, {'`', '~', kVK_ANSI_Grave}
+                };
+                for (const auto& entry : keys)
+                    if (character == entry.plain || character == entry.shifted) nativeCode = entry.code;
+            }
+            break;
+        }
+    }
+    NSEventModifierFlags flags = 0;
+    if (modifiers & kShiftKey) flags |= NSEventModifierFlagShift;
+    if (modifiers & kAlternateKey) flags |= NSEventModifierFlagOption;
+    if (modifiers & kCommandKey) flags |= NSEventModifierFlagCommand;
+    if (modifiers & kControlKey) flags |= NSEventModifierFlagControl;
+    NSEvent* current = NSApp.currentEvent;
+    const NSEventType type = down ? NSEventTypeKeyDown : NSEventTypeKeyUp;
+    constexpr NSEventModifierFlags mask = NSEventModifierFlagShift | NSEventModifierFlagOption |
+        NSEventModifierFlagCommand | NSEventModifierFlagControl;
+    if (current.type == type && current.window == window && (current.modifierFlags & mask) == flags &&
+        ((current.characters.length == 1 && [current.characters characterAtIndex:0] == character) ||
+         current.keyCode == nativeCode))
+        return current;
+    NSString* text = [NSString stringWithCharacters:&character length:1];
+    return [NSEvent keyEventWithType:type
+        location:NSZeroPoint modifierFlags:flags timestamp:NSProcessInfo.processInfo.systemUptime
+        windowNumber:window.windowNumber context:nil characters:text charactersIgnoringModifiers:text
+        isARepeat:NO keyCode:nativeCode];
+}
 
 // ============================================================================
 // FLBridgePlugView: Steinberg::IPlugView hosting Toolbar + Native FL NSView
@@ -107,11 +252,16 @@ public:
     tresult PLUGIN_API attached(void* parent, FIDString type) override;
     tresult PLUGIN_API removed() override;
     tresult PLUGIN_API onWheel(float distance) override { return kResultFalse; }
-    tresult PLUGIN_API onKeyDown(char16 key, int16 keyCode, int16 modifiers) override { return kResultFalse; }
-    tresult PLUGIN_API onKeyUp(char16 key, int16 keyCode, int16 modifiers) override { return kResultFalse; }
+    tresult PLUGIN_API onKeyDown(char16 key, int16 keyCode, int16 modifiers) override;
+    tresult PLUGIN_API onKeyUp(char16 key, int16 keyCode, int16 modifiers) override;
     tresult PLUGIN_API getSize(ViewRect* size) override;
     tresult PLUGIN_API onSize(ViewRect* newSize) override;
-    tresult PLUGIN_API onFocus(TBool state) override { return kResultOk; }
+    tresult PLUGIN_API onFocus(TBool state) override {
+        m_notebookHasFocus = state != 0;
+        if (!state) m_notebookKeys.clear();
+        updateNotebookNativeFocus();
+        return kResultOk;
+    }
     tresult PLUGIN_API setFrame(IPlugFrame* frame) override { m_plugFrame = frame; return kResultOk; }
     tresult PLUGIN_API canResize() override;
     tresult PLUGIN_API checkSizeConstraint(ViewRect* rect) override;
@@ -130,11 +280,14 @@ public:
     std::string getOutputControlHint() const { return m_flInstance->getOutputControlHint(); }
     bool isEffect() const { return !m_flInstance->isInstrument(); }
     void editOutputControl(double value, bool begin, bool end);
+    bool handleNotebookEvent(NSEvent* event);
+    void updateNotebookNativeFocus(bool refresh = false);
 
 private:
     void rebuildPresetMenu();
     void layoutSubviews(int plugW, int plugH);
     void constrainEditorDimensions(int& width, int& height);
+    bool sendNotebookKey(bool down, char16 key, int16 keyCode, int16 modifiers);
 
     std::atomic<uint32> m_refCount{1};
     FLBridgeComponent* m_owner = nullptr;
@@ -162,6 +315,11 @@ private:
     NSArray<NSView*>* m_toolbarControls = nil;
     FloopHoleResizeGrip* m_resizeGrip = nil;
     FloopHoleOutputKnob* m_volumeKnob = nil;
+    NSHashTable<NSView*>* m_notebookFocusViews = nil;
+    __weak id m_notebookWindowWrapper = nil;
+    std::set<unsigned short> m_notebookKeys;
+    bool m_notebookHasFocus = true;
+    bool m_notebookNativeFocused = false;
 };
 
 // ============================================================================
@@ -450,6 +608,36 @@ namespace flbr {
 // FLBridgePlugView Implementation
 // ============================================================================
 
+static void notebookPlatformKey(NSView* view, SEL selector, NSEvent* event) {
+    NSHashTable<FloopHoleToolbarTarget*>* reference = objc_getAssociatedObject(view, &notebookTargetKey);
+    FLBridgePlugView* plugView = reference.anyObject.plugView;
+    const bool handled = plugView && plugView->handleNotebookEvent(event);
+    if (!handled) {
+        Method original = class_getInstanceMethod(class_getSuperclass(object_getClass(view)), selector);
+        reinterpret_cast<void (*)(id, SEL, NSEvent*)>(method_getImplementation(original))(view, selector, event);
+    }
+}
+
+static BOOL notebookKeyEquivalent(NSView* view, SEL selector, NSEvent* event) {
+    NSHashTable<FloopHoleToolbarTarget*>* reference = objc_getAssociatedObject(view, &notebookTargetKey);
+    FLBridgePlugView* plugView = reference.anyObject.plugView;
+    BOOL handled = plugView && plugView->handleNotebookEvent(event);
+    if (!handled) {
+        Method original = class_getInstanceMethod(class_getSuperclass(object_getClass(view)), selector);
+        handled = reinterpret_cast<BOOL (*)(id, SEL, NSEvent*)>(method_getImplementation(original))(view, selector, event);
+    }
+    return handled;
+}
+
+static void notebookMouseUp(NSView* view, SEL selector, NSEvent* event) {
+    NSHashTable<FloopHoleToolbarTarget*>* reference = objc_getAssociatedObject(view, &notebookTargetKey);
+    Method original = class_getInstanceMethod(class_getSuperclass(object_getClass(view)), selector);
+    reinterpret_cast<void (*)(id, SEL, NSEvent*)>(method_getImplementation(original))(view, selector, event);
+    // Native selection must finish before the insertion caret is activated.
+    if (FLBridgePlugView* plugView = reference.anyObject.plugView)
+        plugView->updateNotebookNativeFocus(true);
+}
+
 FLBridgePlugView::FLBridgePlugView(FLBridgeComponent* owner, FLPluginInstance* flInstance)
     : m_owner(owner), m_flInstance(flInstance) {
 }
@@ -479,6 +667,86 @@ tresult PLUGIN_API FLBridgePlugView::isPlatformTypeSupported(FIDString type) {
     return kResultFalse;
 }
 
+bool FLBridgePlugView::handleNotebookEvent(NSEvent* event) {
+    if (!event || !m_target) return false;
+    NSMapTable<FloopHoleToolbarTarget*, NSNumber*>* results = objc_getAssociatedObject(event, &notebookEventResultsKey);
+    if (NSNumber* result = [results objectForKey:m_target]) {
+        return result.boolValue;
+    }
+    if (!m_notebookHasFocus || !m_notebookFocusViews || !m_pluginHostView.window) {
+        return false;
+    }
+    NSResponder* responder = m_pluginHostView.window.firstResponder;
+    if (![responder isKindOfClass:NSView.class] || ![(NSView*)responder isDescendantOf:m_pluginHostView]) {
+        return false;
+    }
+    if (![m_notebookFocusViews containsObject:(NSView*)responder]) {
+        return false;
+    }
+    const bool down = event.type == NSEventTypeKeyDown;
+    const bool up = event.type == NSEventTypeKeyUp;
+    if (!down && !up && event.type != NSEventTypeFlagsChanged) return false;
+    if ((down || up) && (event.modifierFlags & NSEventModifierFlagCommand)) {
+        const unsigned short code = event.keyCode;
+        const bool navigation = code == kVK_Delete || code == kVK_ForwardDelete ||
+            code == kVK_Home || code == kVK_End || code == kVK_LeftArrow || code == kVK_RightArrow ||
+            code == kVK_UpArrow || code == kVK_DownArrow;
+        NSString* text = event.charactersIgnoringModifiers;
+        if (!notebookTextCommand(text.length ? [text characterAtIndex:0] : 0, navigation)) {
+            return false;
+        }
+    }
+    if (!results) {
+        // A host can deliver one event through Cocoa and the VST callbacks.
+        results = [NSMapTable weakToStrongObjectsMapTable];
+        objc_setAssociatedObject(event, &notebookEventResultsKey, results, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+    [results setObject:@NO forKey:m_target];
+    const bool pairedUp = up && m_notebookKeys.erase(event.keyCode) != 0;
+    if (up && !pairedUp) {
+        return false;
+    }
+    const BOOL nativeHandled = [m_notebookWindowWrapper sendKeyEvent:event];
+    const bool handled = nativeHandled || pairedUp; // Do not leak releases for consumed key-downs to the DAW.
+    if (down && handled) m_notebookKeys.insert(event.keyCode);
+    [results setObject:@(handled) forKey:m_target];
+    return handled;
+}
+
+bool FLBridgePlugView::sendNotebookKey(bool down, char16 key, int16 keyCode, int16 modifiers) {
+    if (!m_notebookFocusViews || !m_pluginHostView.window) return false;
+    NSEvent* event = notebookKeyEvent(m_pluginHostView.window, down, key, keyCode, modifiers);
+    if (!event) {
+        return false;
+    }
+    return handleNotebookEvent(event);
+}
+
+tresult PLUGIN_API FLBridgePlugView::onKeyDown(char16 key, int16 keyCode, int16 modifiers) {
+    if (!sendNotebookKey(true, key, keyCode, modifiers)) {
+        return kResultFalse;
+    }
+    return kResultTrue;
+}
+
+tresult PLUGIN_API FLBridgePlugView::onKeyUp(char16 key, int16 keyCode, int16 modifiers) {
+    if (!sendNotebookKey(false, key, keyCode, modifiers)) {
+        return kResultFalse;
+    }
+    return kResultTrue;
+}
+
+void FLBridgePlugView::updateNotebookNativeFocus(bool refresh) {
+    if (!m_notebookFocusViews || !m_flInstance) return;
+    NSWindow* window = m_pluginHostView.window;
+    NSResponder* responder = window.firstResponder;
+    const bool focused = m_notebookHasFocus && window.keyWindow &&
+        [responder isKindOfClass:NSView.class] && [m_notebookFocusViews containsObject:(NSView*)responder];
+    if (focused == m_notebookNativeFocused && !(refresh && focused)) return;
+    m_notebookNativeFocused = focused;
+    m_flInstance->setEditorFocus(focused);
+}
+
 tresult PLUGIN_API FLBridgePlugView::attached(void* parent, FIDString type) {
     if (!parent || isPlatformTypeSupported(type) != kResultTrue) {
         return kResultFalse;
@@ -486,6 +754,7 @@ tresult PLUGIN_API FLBridgePlugView::attached(void* parent, FIDString type) {
 
     @autoreleasepool {
         NSView* parentNSView = (__bridge NSView*)parent;
+        m_notebookHasFocus = true;
 
         // Create our container view and subviews
         NSRect initRect = NSMakeRect(0, 0, m_plugWidth, m_plugHeight + m_toolbarHeight + m_resizeFooterHeight);
@@ -570,6 +839,20 @@ tresult PLUGIN_API FLBridgePlugView::attached(void* parent, FIDString type) {
 
             int pw = 900, ph = 600;
             if (m_flInstance->attachEditorToNSView((__bridge void*)m_pluginHostView, pw, ph)) {
+                const std::string& name = m_flInstance->getPluginName();
+                if (name == "Fruity NoteBook" || name == "Fruity NoteBook 2") {
+                    NSView* editor = m_pluginHostView.subviews.firstObject;
+                    Ivar owner = class_getInstanceVariable(NSClassFromString(@"D1NSView"), "owner");
+                    if (editor && owner && [editor isKindOfClass:NSClassFromString(@"D1NSView")]) {
+                        m_notebookWindowWrapper = object_getIvar(editor, owner);
+                        m_notebookFocusViews = [NSHashTable weakObjectsHashTable];
+                        NSHashTable<FloopHoleToolbarTarget*>* reference = [NSHashTable weakObjectsHashTable];
+                        [reference addObject:m_target];
+                        installNotebookFocus(editor, m_notebookFocusViews, reference);
+                    } else {
+                        fprintf(stderr, "FloopHole: native notebook keyboard routing is unavailable\n");
+                    }
+                }
                 layoutSubviews(pw, ph);
                 if (m_plugFrame) {
                     ViewRect vr{};
@@ -591,6 +874,19 @@ tresult PLUGIN_API FLBridgePlugView::attached(void* parent, FIDString type) {
 }
 
 tresult PLUGIN_API FLBridgePlugView::removed() {
+    m_notebookKeys.clear();
+    if (m_notebookNativeFocused && m_flInstance) m_flInstance->setEditorFocus(false);
+    m_notebookNativeFocused = false;
+    NSResponder* notebookResponder = m_pluginHostView.window.firstResponder;
+    if (m_notebookFocusViews && [notebookResponder isKindOfClass:NSView.class] &&
+        [(NSView*)notebookResponder isDescendantOf:m_pluginHostView])
+        [m_pluginHostView.window makeFirstResponder:nil];
+    for (NSView* view in m_notebookFocusViews.allObjects) {
+        objc_setAssociatedObject(view, &notebookTargetKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        object_setClass(view, class_getSuperclass(object_getClass(view)));
+    }
+    m_notebookFocusViews = nil;
+    m_notebookWindowWrapper = nil;
     [m_presetPopup closeMenu];
     if (m_presetPopup) m_presetPopup->onSelect = nullptr;
     if (m_volumeKnob.dragging) editOutputControl(getOutputControlValue(), false, true);
@@ -814,6 +1110,7 @@ void FLBridgePlugView::promptLoadFstFile() {
 }
 
 void FLBridgePlugView::onTimerTick() {
+    updateNotebookNativeFocus();
     m_volumeKnob.volume = getOutputControlValue();
     if (m_flInstance) {
         m_flInstance->idleEditor();

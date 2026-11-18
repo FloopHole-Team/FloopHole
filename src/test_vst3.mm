@@ -1,5 +1,7 @@
 #import <Cocoa/Cocoa.h>
 #import <objc/runtime.h>
+#include <Carbon/Carbon.h>
+#import <Metal/Metal.h>
 #include "FLPluginScanner.h"
 #include "FLPluginInstance.h"
 #include "BridgeEditorLayout.h"
@@ -8,6 +10,7 @@
 #include "pluginterfaces/base/funknown.h"
 #include "pluginterfaces/base/ipluginbase.h"
 #include "pluginterfaces/base/ibstream.h"
+#include "pluginterfaces/base/keycodes.h"
 #include "pluginterfaces/vst/ivstcomponent.h"
 #include "pluginterfaces/vst/ivstaudioprocessor.h"
 #include "pluginterfaces/vst/ivsteditcontroller.h"
@@ -46,13 +49,33 @@
 - (BOOL)windowShouldClose:(NSWindow*)sender { return YES; }
 @end
 
+@interface FLBridgeNotebookTestWindow : NSWindow
+@property(nonatomic) BOOL testKeyWindow;
+@end
+@implementation FLBridgeNotebookTestWindow
+- (BOOL)isKeyWindow { return self.testKeyWindow; }
+@end
+
+@interface NSUserDefaults (FLBridgeNotebookCanvasTest)
+- (id)flBridgeTestNotebookObjectForKey:(NSString*)key;
+@end
+@implementation NSUserDefaults (FLBridgeNotebookCanvasTest)
+- (id)flBridgeTestNotebookObjectForKey:(NSString*)key {
+    if ([key isEqualToString:@"UseMetal"]) return @"yes";
+    return [self flBridgeTestNotebookObjectForKey:key];
+}
+@end
+
 static NSPoint testMouseLocation;
 static NSWindow* testCursorWindow;
+static NSEvent* testHostKeyEvent;
 @interface NSApplication (FLBridgeTestActivation)
 - (BOOL)flBridgeTestIsActive;
+- (NSEvent*)flBridgeTestCurrentEvent;
 @end
 @implementation NSApplication (FLBridgeTestActivation)
 - (BOOL)flBridgeTestIsActive { return YES; }
+- (NSEvent*)flBridgeTestCurrentEvent { return testHostKeyEvent; }
 @end
 static double testNativeMouseScale = 1;
 static void testNativeCursorPosition(NSPoint* point) {
@@ -2381,6 +2404,265 @@ static void verifyTransportUtilities(const char* screenshotDirectory) {
     }
 }
 
+struct NotebookCanvasFrame {
+    NSData* pixels;
+    NSInteger width, height, stride;
+};
+
+static NotebookCanvasFrame notebookCanvasFrame(NSView* writingView, NSView* editor) {
+    Ivar backendIvar = class_getInstanceVariable(NSClassFromString(@"D1NSView"), "backend");
+    CHECK(backendIvar);
+    id backend = object_getIvar(writingView, backendIvar);
+    if (!backend) backend = object_getIvar(editor, backendIvar);
+    CHECK([backend isKindOfClass:NSClassFromString(@"D1BackendMetal")]);
+    id<MTLBuffer> buffer = [backend valueForKey:@"metalTextureBuffer"];
+    const NSInteger width = [[backend valueForKey:@"metalTextureWidth"] integerValue];
+    const NSInteger height = [[backend valueForKey:@"metalTextureHeight"] integerValue];
+    const NSInteger stride = [[backend valueForKey:@"metalTextureLineStride"] integerValue];
+    CHECK(buffer && buffer.contents && width > 0 && height > 0 && stride >= width * 4 &&
+        buffer.length >= stride * height);
+    return {[NSData dataWithBytes:buffer.contents length:stride * height], width, height, stride};
+}
+
+static void verifyNotebookCaret(NSView* writingView, NSView* editor) {
+    [NSRunLoop.currentRunLoop runUntilDate:[NSDate dateWithTimeIntervalSinceNow:0.15]];
+    const auto first = notebookCanvasFrame(writingView, editor);
+    bool previousChanged = false;
+    int transitions = 0;
+    for (int i = 0; i < 12; ++i) {
+        [NSRunLoop.currentRunLoop runUntilDate:[NSDate dateWithTimeIntervalSinceNow:0.12]];
+        const auto frame = notebookCanvasFrame(writingView, editor);
+        CHECK(frame.width == first.width && frame.height == first.height && frame.stride == first.stride);
+        const auto* a = static_cast<const uint8_t*>(first.pixels.bytes);
+        const auto* b = static_cast<const uint8_t*>(frame.pixels.bytes);
+        NSInteger minX = frame.width, minY = frame.height, maxX = -1, maxY = -1;
+        size_t changed = 0;
+        for (NSInteger y = 0; y < frame.height; ++y) {
+            for (NSInteger x = 0; x < frame.width; ++x) {
+                const NSInteger offset = y * frame.stride + x * 4;
+                if (memcmp(a + offset, b + offset, 4) == 0) continue;
+                minX = std::min(minX, x);
+                minY = std::min(minY, y);
+                maxX = std::max(maxX, x);
+                maxY = std::max(maxY, y);
+                ++changed;
+            }
+        }
+        if (changed) {
+            CHECK(maxX - minX + 1 <= 4 && maxY - minY + 1 >= 8 && maxY - minY + 1 <= 80);
+            CHECK(changed == static_cast<size_t>((maxX - minX + 1) * (maxY - minY + 1)));
+        }
+        if ((changed != 0) != previousChanged) ++transitions;
+        previousChanged = changed != 0;
+    }
+    CHECK(transitions >= 2);
+    fprintf(stderr, "Native notebook caret: thin insertion bar blinked %d times\n", transitions);
+}
+
+static void verifyNotebookKeyboard(const char* name, bool appKitKeys = false, bool caretProbe = false) {
+    Method defaults = class_getInstanceMethod(NSUserDefaults.class, @selector(objectForKey:));
+    Method testDefaults = class_getInstanceMethod(NSUserDefaults.class, @selector(flBridgeTestNotebookObjectForKey:));
+    // Keep framebuffer readback local to the test process, without changing user preferences.
+    if (caretProbe) method_exchangeImplementations(defaults, testDefaults);
+    void* bundle = dlopen("./build/VST3/FloopHole.vst3/Contents/MacOS/FloopHole", RTLD_NOW);
+    CHECK(bundle);
+    auto entry = reinterpret_cast<BundleEntryFn>(dlsym(bundle, "bundleEntry"));
+    auto factoryFn = reinterpret_cast<GetPluginFactoryFn>(dlsym(bundle, "GetPluginFactory"));
+    auto bundleExit = reinterpret_cast<BundleExitFn>(dlsym(bundle, "bundleExit"));
+    CHECK(entry && factoryFn && bundleExit && entry(nullptr));
+    IPluginFactory* factory = factoryFn();
+    PClassInfo info = nativeClassInfo(factory, name);
+    IComponent* component = nullptr;
+    CHECK(factory->createInstance(info.cid, IComponent::iid, reinterpret_cast<void**>(&component)) == kResultOk);
+    CHECK(component->initialize(nullptr) == kResultOk);
+    IEditController* controller = nullptr;
+    CHECK(component->queryInterface(IEditController::iid, reinterpret_cast<void**>(&controller)) == kResultOk);
+    IPlugView* view = controller->createView(ViewType::kEditor);
+    TestPlugFrame frame;
+    CHECK(view && view->setFrame(&frame) == kResultOk);
+    FLBridgeNotebookTestWindow* window = [[FLBridgeNotebookTestWindow alloc] initWithContentRect:NSMakeRect(120, 120, 1200, 900)
+        styleMask:NSWindowStyleMaskTitled backing:NSBackingStoreBuffered defer:NO];
+    window.testKeyWindow = caretProbe;
+    window.releasedWhenClosed = NO;
+    CHECK(view->attached((__bridge void*)window.contentView, kPlatformTypeNSView) == kResultOk);
+    ViewRect size{};
+    CHECK(view->getSize(&size) == kResultOk);
+    [window setContentSize:NSMakeSize(size.getWidth(), size.getHeight())];
+    [window makeKeyAndOrderFront:nil];
+    [NSRunLoop.currentRunLoop runUntilDate:[NSDate dateWithTimeIntervalSinceNow:0.2]];
+    NSView* editor = findNativeEditor(window.contentView);
+    CHECK(editor);
+    const auto containsText = [&](const TestMemoryStream& state, NSString* text) {
+        const NSStringEncoding encoding = strcmp(name, "Fruity NoteBook 2") == 0 ? NSUTF16LittleEndianStringEncoding :
+            NSUTF8StringEncoding;
+        NSData* encoded = [text dataUsingEncoding:encoding];
+        const auto* start = static_cast<const uint8_t*>(encoded.bytes);
+        return std::search(state.bytes.begin(), state.bytes.end(), start, start + encoded.length) != state.bytes.end();
+    };
+    const auto clickText = [&] {
+        NSPoint point = NSMakePoint(editor.bounds.size.width / 2, editor.bounds.size.height / 2);
+        clickNativeEditor(nullptr, window, editor, point);
+    };
+    CHECK([window makeFirstResponder:window]);
+    CHECK(view->onKeyDown(u'n', 0, 0) == kResultFalse);
+    CHECK(view->onKeyUp(u'n', 0, 0) == kResultFalse);
+    clickText();
+    CHECK([window.firstResponder isKindOfClass:NSView.class] &&
+        [(NSView*)window.firstResponder isDescendantOf:editor]);
+    if (caretProbe) {
+        NSView* writingView = (NSView*)window.firstResponder;
+        verifyNotebookCaret(writingView, editor);
+        CHECK([window makeFirstResponder:findVolumeKnob(window.contentView)]);
+        clickText();
+        verifyNotebookCaret(writingView, editor);
+        window.testKeyWindow = NO;
+        [NSRunLoop.currentRunLoop runUntilDate:[NSDate dateWithTimeIntervalSinceNow:0.1]];
+        window.testKeyWindow = YES;
+        verifyNotebookCaret(writingView, editor);
+    }
+    const auto platformKeyEvent = [&](bool down, char16 key, int16 code, int16 modifiers) {
+        unichar character = key;
+        unsigned short nativeCode = kVK_ANSI_A;
+        switch (code) {
+            case KEY_BACK: character = NSDeleteCharacter; nativeCode = kVK_Delete; break;
+            case KEY_DELETE: character = NSDeleteFunctionKey; nativeCode = kVK_ForwardDelete; break;
+            case KEY_RETURN: character = NSCarriageReturnCharacter; nativeCode = kVK_Return; break;
+            case KEY_LEFT: character = NSLeftArrowFunctionKey; nativeCode = kVK_LeftArrow; break;
+        }
+        if (key == u'R' || key == u'r') nativeCode = kVK_ANSI_R;
+        NSEventModifierFlags flags = 0;
+        if (modifiers & kCommandKey) flags |= NSEventModifierFlagCommand;
+        if (modifiers & kShiftKey) flags |= NSEventModifierFlagShift;
+        NSString* text = [NSString stringWithCharacters:&character length:1];
+        return [NSEvent keyEventWithType:down ? NSEventTypeKeyDown : NSEventTypeKeyUp
+            location:NSZeroPoint modifierFlags:flags timestamp:NSProcessInfo.processInfo.systemUptime
+            windowNumber:window.windowNumber context:nil characters:text charactersIgnoringModifiers:text
+            isARepeat:NO keyCode:nativeCode];
+    };
+    const auto press = [&](char16 key, int16 code = 0, int16 modifiers = 0) {
+        if (appKitKeys) {
+            [NSApp sendEvent:platformKeyEvent(true, key, code, modifiers)];
+            [NSApp sendEvent:platformKeyEvent(false, key, code, modifiers)];
+        } else {
+            CHECK(view->onKeyDown(key, code, modifiers) == kResultTrue);
+            CHECK(view->onKeyUp(key, code, modifiers) == kResultTrue);
+        }
+    };
+    press(u'a', 0, kCommandKey);
+    for (char16 key : std::u16string(u"FloopHole notes 42")) press(key);
+    TestMemoryStream typed;
+    CHECK(component->getState(&typed) == kResultOk);
+    CHECK(containsText(typed, @"FloopHole notes 42"));
+    press(0, KEY_BACK);
+    press(u'\u00e9');
+    TestMemoryStream edited;
+    CHECK(component->getState(&edited) == kResultOk);
+    CHECK(containsText(edited, @"FloopHole notes 4\u00e9"));
+    CHECK(!containsText(edited, @"FloopHole notes 42"));
+    press(0, KEY_LEFT);
+    press(0, KEY_DELETE);
+    TestMemoryStream deleted;
+    CHECK(component->getState(&deleted) == kResultOk);
+    CHECK(containsText(deleted, @"FloopHole notes 4") && !containsText(deleted, @"FloopHole notes 4\u00e9"));
+    press(0, KEY_RETURN);
+    for (char16 key : std::u16string(u"Second line")) press(key);
+    TestMemoryStream multiline;
+    CHECK(component->getState(&multiline) == kResultOk);
+    CHECK(containsText(multiline, @"Second line"));
+    press(u'a', 0, kCommandKey);
+    if (appKitKeys) {
+        [NSApp sendEvent:platformKeyEvent(true, u'R', 0, kShiftKey)];
+        [NSApp sendEvent:platformKeyEvent(false, u'r', 0, 0)];
+    } else {
+        CHECK(view->onKeyDown(u'R', 0, kShiftKey) == kResultTrue);
+        CHECK(view->onKeyUp(u'r', 0, 0) == kResultTrue);
+    }
+    for (char16 key : std::u16string(u"eplacement")) press(key);
+    TestMemoryStream replaced;
+    CHECK(component->getState(&replaced) == kResultOk);
+    CHECK(containsText(replaced, @"Replacement") && !containsText(replaced, @"Second line"));
+    CHECK(view->onKeyDown(u'q', 0, kCommandKey) == kResultFalse);
+    CHECK(view->onKeyUp(u'q', 0, kCommandKey) == kResultFalse);
+    if (appKitKeys) CHECK(![(NSView*)window.firstResponder performKeyEquivalent:platformKeyEvent(true, u'q', 0, kCommandKey)]);
+    CHECK(view->onFocus(false) == kResultOk);
+    CHECK(view->onKeyDown(u'n', 0, 0) == kResultFalse);
+    CHECK(view->onFocus(true) == kResultOk);
+    NSView* knob = findVolumeKnob(window.contentView);
+    CHECK(knob && [window makeFirstResponder:knob]);
+    CHECK(view->onKeyDown(u'n', 0, 0) == kResultFalse);
+    CHECK(view->onKeyUp(u'n', 0, 0) == kResultFalse);
+    if (appKitKeys) {
+        [NSApp sendEvent:platformKeyEvent(true, u'n', 0, 0)];
+        [NSApp sendEvent:platformKeyEvent(false, u'n', 0, 0)];
+        TestMemoryStream outside;
+        CHECK(component->getState(&outside) == kResultOk);
+        CHECK(containsText(outside, @"Replacement") && !containsText(outside, @"Replacementn"));
+    }
+    CHECK(view->removed() == kResultOk);
+    typed.pos = 0;
+    CHECK(component->setState(&typed) == kResultOk);
+    CHECK(view->attached((__bridge void*)window.contentView, kPlatformTypeNSView) == kResultOk);
+    editor = findNativeEditor(window.contentView);
+    CHECK(editor);
+    clickText();
+    if (caretProbe) verifyNotebookCaret((NSView*)window.firstResponder, editor);
+    TestMemoryStream restored;
+    CHECK(component->getState(&restored) == kResultOk);
+    CHECK(containsText(restored, @"FloopHole notes 42"));
+    press(u'a', 0, kCommandKey);
+    for (char16 key : std::u16string(u"Reopened")) press(key);
+    TestMemoryStream reopened;
+    CHECK(component->getState(&reopened) == kResultOk);
+    CHECK(containsText(reopened, @"Reopened"));
+    if (appKitKeys) {
+        press(u'a', 0, kCommandKey);
+        for (char16 key : std::u16string(u"Both routes: ")) press(key);
+        Method current = class_getInstanceMethod(NSApplication.class, @selector(currentEvent));
+        Method fakeCurrent = class_getInstanceMethod(NSApplication.class, @selector(flBridgeTestCurrentEvent));
+        method_exchangeImplementations(current, fakeCurrent);
+        // Simulate hosts invoking both APIs for one physical event, in either order.
+        for (char16 key : {u'd', u's'}) {
+            testHostKeyEvent = platformKeyEvent(true, key, 0, 0);
+            if (key == u'd') {
+                CHECK([(NSView*)window.firstResponder performKeyEquivalent:testHostKeyEvent]);
+                [NSApp sendEvent:testHostKeyEvent];
+                CHECK(view->onKeyDown(key, 0, 0) == kResultTrue);
+            } else {
+                CHECK(view->onKeyDown(key, 0, 0) == kResultTrue);
+                [NSApp sendEvent:testHostKeyEvent];
+                CHECK([(NSView*)window.firstResponder performKeyEquivalent:testHostKeyEvent]);
+            }
+            testHostKeyEvent = platformKeyEvent(false, key, 0, 0);
+            if (key == u'd') {
+                [NSApp sendEvent:testHostKeyEvent];
+                CHECK(view->onKeyUp(key, 0, 0) == kResultTrue);
+            } else {
+                CHECK(view->onKeyUp(key, 0, 0) == kResultTrue);
+                [NSApp sendEvent:testHostKeyEvent];
+            }
+        }
+        testHostKeyEvent = nil;
+        method_exchangeImplementations(current, fakeCurrent);
+        press(u'.');
+        TestMemoryStream dual;
+        CHECK(component->getState(&dual) == kResultOk);
+        CHECK(containsText(dual, @"Both routes: ds."));
+    }
+    if (caretProbe) verifyNotebookCaret((NSView*)window.firstResponder, editor);
+    CHECK(view->removed() == kResultOk);
+    view->release();
+    controller->release();
+    CHECK(component->terminate() == kResultOk);
+    component->release();
+    [window close];
+    factory->release();
+    CHECK(bundleExit());
+    CHECK(dlclose(bundle) == 0);
+    if (caretProbe) method_exchangeImplementations(defaults, testDefaults);
+    fprintf(stderr, "%s %s keyboard focus, editing, host shortcut pass-through and saved notes passed\n",
+        name, appKitKeys ? "AppKit" : "VST");
+}
+
 static void verifyNativeVSTHoverHelp() {
     void* bundle = dlopen("./build/VST3/FloopHole.vst3/Contents/MacOS/FloopHole", RTLD_NOW);
     CHECK(bundle);
@@ -2469,6 +2751,8 @@ static void verifyNativeVSTHoverHelp() {
             fprintf(stderr, "%s hover cycle %d: '%s'\n", test.plugin, cycle, hint.stringValue.UTF8String);
             CHECK([hint.stringValue localizedCaseInsensitiveContainsString:expected]);
             CHECK([hint.toolTip isEqualToString:hint.stringValue]);
+            CHECK(view->onKeyDown(u'n', 0, 0) == kResultFalse);
+            CHECK(view->onKeyUp(u'n', 0, 0) == kResultFalse);
             *cursorBinding = savedCursorBinding;
             method_exchangeImplementations(top, fakeTop);
             method_exchangeImplementations(active, fakeActive);
@@ -2849,6 +3133,23 @@ int main(int argc, char** argv) {
             return 0;
         }
         [NSApplication sharedApplication];
+        if (argc > 1 && strcmp(argv[1], "--notebook-caret") == 0) {
+            if (argc > 2) verifyNotebookKeyboard(argv[2], true, true);
+            else for (const char* name : {"Fruity NoteBook", "Fruity NoteBook 2"})
+                verifyNotebookKeyboard(name, true, true);
+            return 0;
+        }
+        if (argc > 1 && strcmp(argv[1], "--notebook-appkit-keyboard") == 0) {
+            for (const char* name : {"Fruity NoteBook", "Fruity NoteBook 2"})
+                verifyNotebookKeyboard(name, true);
+            return 0;
+        }
+        if (argc > 1 && strcmp(argv[1], "--notebook-keyboard") == 0) {
+            if (argc > 2) verifyNotebookKeyboard(argv[2]);
+            else for (const char* name : {"Fruity NoteBook", "Fruity NoteBook 2"})
+                verifyNotebookKeyboard(name);
+            return 0;
+        }
         if (argc > 1 && strcmp(argv[1], "--native-hover-help") == 0) {
             verifyNativeVSTHoverHelp();
             return 0;

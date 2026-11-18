@@ -1557,6 +1557,28 @@ bool FLPluginInstance::resizeEditor(int& width, int& height) {
     return false;
 }
 
+void FLPluginInstance::setEditorFocus(bool focused) {
+    std::lock_guard<std::recursive_mutex> lock(m_mutex);
+    if (!m_plug || !m_editorOpen || !m_parentNSView) return;
+    NSView* editor = nativeEditorView((__bridge NSView*)m_parentNSView);
+    for (NSWindow* backing in NSApp.windows) {
+        if (hostedEditorForWindow(backing) != editor) continue;
+        id<NSWindowDelegate> delegate = backing.delegate;
+        const SEL selector = focused ? @selector(windowDidBecomeKey:) : @selector(windowDidResignKey:);
+        if (![delegate respondsToSelector:selector]) {
+            fprintf(stderr, "FloopHole: native editor caret focus notification is unavailable\n");
+            return;
+        }
+        // The embedded MacVCL window never receives the DAW window's activation notifications.
+        NSNotification* notification = [NSNotification notificationWithName:
+            focused ? NSWindowDidBecomeKeyNotification : NSWindowDidResignKeyNotification object:backing];
+        if (focused) [delegate windowDidBecomeKey:notification];
+        else [delegate windowDidResignKey:notification];
+        return;
+    }
+    fprintf(stderr, "FloopHole: native editor caret focus window is unavailable\n");
+}
+
 void FLPluginInstance::detachEditor() {
     std::lock_guard<std::recursive_mutex> lock(m_mutex);
     if (!m_plug || !m_fnDispatcher || !m_editorOpen) return;
