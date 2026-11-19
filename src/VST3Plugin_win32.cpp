@@ -160,14 +160,20 @@ private:
     HINSTANCE m_windowClassModule = nullptr;
     std::unique_ptr<WindowsToolbar> m_toolbar;
     HWND m_pluginHostHwnd = nullptr;
+    HWND m_lastPluginTargetHwnd = nullptr;
     HBRUSH m_bgBrush = nullptr;
     Win32EditorKeyboard m_editorKeyboard;
-    bool usesNativeEditorKeyboard() const {
-        if (!m_flInstance) return false;
-        const auto& name = m_flInstance->getPluginName();
-        return name == "Edison" || name == "Fruity NoteBook" || name == "Fruity NoteBook 2";
-    }
+    bool m_editorKeyboardFocused = false;
 
+    void registerKeyboardHook();
+    void unregisterKeyboardHook();
+    void setNativeEditorFocus(bool focused);
+    HWND resolveFallbackTarget() const;
+    bool dispatchEditorKeyDown(UINT vk, char16 key, int16 keyCode, int16 modifiers);
+    bool dispatchEditorKeyUp(UINT vk, int16 keyCode, int16 modifiers);
+    void onHookMouseDown(HWND clickedHwnd);
+    bool handleHookKeyMessage(const MSG& msg);
+    static LRESULT CALLBACK GetMsgHookProc(int code, WPARAM wParam, LPARAM lParam);
 };
 
 // ============================================================================
@@ -499,21 +505,279 @@ LRESULT CALLBACK FLBridgePlugView::RootWndProc(HWND hwnd, UINT msg, WPARAM wPara
     return DefWindowProcW(hwnd, msg, wParam, lParam);
 }
 
+static thread_local std::vector<FLBridgePlugView*> gThreadEditorViews;
+static thread_local HHOOK gThreadGetMsgHook = nullptr;
+static thread_local bool gInEditorKeyDispatch = false;
+
+void FLBridgePlugView::registerKeyboardHook() {
+    if (std::find(gThreadEditorViews.begin(), gThreadEditorViews.end(), this) == gThreadEditorViews.end())
+        gThreadEditorViews.push_back(this);
+    if (!gThreadGetMsgHook) {
+        gThreadGetMsgHook = SetWindowsHookExW(WH_GETMESSAGE, &FLBridgePlugView::GetMsgHookProc,
+                                              nullptr, GetCurrentThreadId());
+    }
+}
+
+void FLBridgePlugView::unregisterKeyboardHook() {
+    auto it = std::find(gThreadEditorViews.begin(), gThreadEditorViews.end(), this);
+    if (it != gThreadEditorViews.end())
+        gThreadEditorViews.erase(it);
+    if (gThreadEditorViews.empty() && gThreadGetMsgHook) {
+        UnhookWindowsHookEx(gThreadGetMsgHook);
+        gThreadGetMsgHook = nullptr;
+    }
+}
+
+static bool isPureModifierVk(UINT vk) {
+    switch (vk) {
+        case VK_SHIFT: case VK_LSHIFT: case VK_RSHIFT:
+        case VK_CONTROL: case VK_LCONTROL: case VK_RCONTROL:
+        case VK_MENU: case VK_LMENU: case VK_RMENU:
+        case VK_LWIN: case VK_RWIN:
+            return true;
+        default:
+            return false;
+    }
+}
+
+static bool isCtrlNavigationKey(UINT vk) {
+    switch (vk) {
+        case VK_LEFT: case VK_RIGHT: case VK_UP: case VK_DOWN:
+        case VK_HOME: case VK_END: case VK_PRIOR: case VK_NEXT:
+        case VK_BACK: case VK_DELETE:
+            return true;
+        default:
+            return false;
+    }
+}
+
+static bool isSpecialEditorKey(UINT vk) {
+    if (isCtrlNavigationKey(vk)) return true;
+    if (vk >= VK_F1 && vk <= VK_F24) return true;
+    switch (vk) {
+        case VK_SPACE: case VK_RETURN: case VK_TAB: case VK_ESCAPE: case VK_INSERT:
+            return true;
+        default:
+            return false;
+    }
+}
+
+static int16 queryCurrentSteinbergModifiers() {
+    int16 modifiers = 0;
+    if (GetKeyState(VK_SHIFT) & 0x8000) modifiers |= kShiftKey;
+    if (GetKeyState(VK_MENU) & 0x8000) modifiers |= kAlternateKey;
+    if (GetKeyState(VK_CONTROL) & 0x8000) modifiers |= kCommandKey;
+    if ((GetKeyState(VK_LWIN) | GetKeyState(VK_RWIN)) & 0x8000) modifiers |= kControlKey;
+    return modifiers;
+}
+
+static int16 normalizeHostModifiers(int16 modifiers) {
+    // Some Windows VST3 hosts report Ctrl as kControlKey instead of kCommandKey.
+    if ((modifiers & kControlKey) && !(modifiers & kCommandKey) &&
+        (GetKeyState(VK_CONTROL) & 0x8000) &&
+        !((GetKeyState(VK_LWIN) | GetKeyState(VK_RWIN)) & 0x8000)) {
+        modifiers = static_cast<int16>((modifiers & ~kControlKey) | kCommandKey);
+    }
+    return modifiers;
+}
+
+static void nativeVkToSteinberg(UINT vk, LPARAM lParam, int16 modifiers, char16& outKey, int16& outKeyCode) {
+    outKey = 0;
+    outKeyCode = 0;
+    if ((vk >= '0' && vk <= '9') || (vk >= 'A' && vk <= 'Z')) {
+        outKeyCode = static_cast<int16>(CharToVirtualKeyCode(static_cast<tchar>(vk)));
+        if (vk >= 'A' && vk <= 'Z' && !(modifiers & kShiftKey))
+            outKey = static_cast<char16>(vk - 'A' + 'a');
+        else
+            outKey = static_cast<char16>(vk);
+        return;
+    }
+    switch (vk) {
+        case VK_BACK:   outKeyCode = KEY_BACK;   outKey = u'\b'; return;
+        case VK_TAB:    outKeyCode = KEY_TAB;    outKey = u'\t'; return;
+        case VK_CLEAR:  outKeyCode = KEY_CLEAR;  return;
+        case VK_RETURN: outKeyCode = (lParam & (LPARAM(1) << 24)) ? KEY_ENTER : KEY_RETURN; outKey = u'\r'; return;
+        case VK_PAUSE:  outKeyCode = KEY_PAUSE;  return;
+        case VK_ESCAPE: outKeyCode = KEY_ESCAPE; outKey = 0x1b;  return;
+        case VK_SPACE:  outKeyCode = KEY_SPACE;  outKey = u' ';  return;
+        case VK_PRIOR:  outKeyCode = KEY_PAGEUP; return;
+        case VK_NEXT:   outKeyCode = KEY_PAGEDOWN; return;
+        case VK_END:    outKeyCode = KEY_END;    return;
+        case VK_HOME:   outKeyCode = KEY_HOME;   return;
+        case VK_LEFT:   outKeyCode = KEY_LEFT;   return;
+        case VK_UP:     outKeyCode = KEY_UP;     return;
+        case VK_RIGHT:  outKeyCode = KEY_RIGHT;  return;
+        case VK_DOWN:   outKeyCode = KEY_DOWN;   return;
+        case VK_INSERT: outKeyCode = KEY_INSERT; return;
+        case VK_DELETE: outKeyCode = KEY_DELETE; return;
+        default: break;
+    }
+    if (vk >= VK_NUMPAD0 && vk <= VK_NUMPAD9) {
+        outKeyCode = static_cast<int16>(KEY_NUMPAD0 + (vk - VK_NUMPAD0));
+        return;
+    }
+    if (vk >= VK_F1 && vk <= VK_F12) {
+        outKeyCode = static_cast<int16>(KEY_F1 + (vk - VK_F1));
+        return;
+    }
+    if (vk >= VK_F13 && vk <= VK_F24) {
+        outKeyCode = static_cast<int16>(KEY_F13 + (vk - VK_F13));
+        return;
+    }
+    const UINT ch = MapVirtualKeyW(vk, MAPVK_VK_TO_CHAR) & 0x7fff;
+    if (ch) outKey = static_cast<char16>(ch);
+}
+
+void FLBridgePlugView::setNativeEditorFocus(bool focused) {
+    if (m_editorKeyboardFocused == focused) return;
+    m_editorKeyboardFocused = focused;
+    if (!focused) m_editorKeyboard.reset();
+    if (m_flInstance) m_flInstance->setEditorFocus(focused);
+}
+
+HWND FLBridgePlugView::resolveFallbackTarget() const {
+    if (!m_pluginHostHwnd || !m_editorKeyboardFocused) return nullptr;
+    HWND focusHwnd = GetFocus();
+    if (focusHwnd && m_rootHwnd && (focusHwnd == m_rootHwnd || IsChild(m_rootHwnd, focusHwnd)) &&
+        !IsChild(m_pluginHostHwnd, focusHwnd)) {
+        return nullptr;
+    }
+    if (m_lastPluginTargetHwnd && IsWindow(m_lastPluginTargetHwnd) &&
+        IsChild(m_pluginHostHwnd, m_lastPluginTargetHwnd)) {
+        return m_lastPluginTargetHwnd;
+    }
+    HWND child = GetWindow(m_pluginHostHwnd, GW_CHILD);
+    return (child && IsWindow(child)) ? child : nullptr;
+}
+
+bool FLBridgePlugView::dispatchEditorKeyDown(UINT vk, char16 key, int16 keyCode, int16 modifiers) {
+    if (!m_pluginHostHwnd || !m_flInstance || !m_flInstance->isEditorOpen()) return false;
+    HWND focusHwnd = GetFocus();
+    const bool childFocused = focusHwnd && IsChild(m_pluginHostHwnd, focusHwnd);
+    const bool allowRawKey = childFocused && m_flInstance->wantsEditorKeyboardInput() &&
+        (!(modifiers & kCommandKey) || isCtrlNavigationKey(vk));
+    const HWND fallback = childFocused ? nullptr : resolveFallbackTarget();
+    if (!childFocused && !fallback) return false;
+    const bool prevGuard = gInEditorKeyDispatch;
+    gInEditorKeyDispatch = true;
+    const bool handled = m_editorKeyboard.keyDownVk(m_pluginHostHwnd, vk, key, keyCode, modifiers,
+                                                    allowRawKey, fallback);
+    gInEditorKeyDispatch = prevGuard;
+    return handled;
+}
+
+bool FLBridgePlugView::dispatchEditorKeyUp(UINT vk, int16 keyCode, int16 modifiers) {
+    if (!m_pluginHostHwnd) return false;
+    const bool prevGuard = gInEditorKeyDispatch;
+    gInEditorKeyDispatch = true;
+    const bool handled = m_editorKeyboard.keyUpVk(m_pluginHostHwnd, vk, keyCode, modifiers);
+    gInEditorKeyDispatch = prevGuard;
+    return handled;
+}
+
+void FLBridgePlugView::onHookMouseDown(HWND clickedHwnd) {
+    if (!m_pluginHostHwnd || !IsWindow(m_pluginHostHwnd)) return;
+    const bool insidePlugin = clickedHwnd &&
+        (clickedHwnd == m_pluginHostHwnd || IsChild(m_pluginHostHwnd, clickedHwnd));
+    if (insidePlugin && clickedHwnd != m_pluginHostHwnd)
+        m_lastPluginTargetHwnd = clickedHwnd;
+    setNativeEditorFocus(insidePlugin);
+}
+
+bool FLBridgePlugView::handleHookKeyMessage(const MSG& msg) {
+    if (!m_rootHwnd || !m_pluginHostHwnd || !m_flInstance || !m_flInstance->isEditorOpen() ||
+        !IsWindowVisible(m_rootHwnd))
+        return false;
+    if (m_toolbar && m_toolbar->menuWindow() && IsWindowVisible(m_toolbar->menuWindow()))
+        return false;
+
+    const UINT vk = static_cast<UINT>(msg.wParam);
+    const int16 modifiers = queryCurrentSteinbergModifiers();
+    char16 key = 0;
+    int16 keyCode = 0;
+    nativeVkToSteinberg(vk, msg.lParam, modifiers, key, keyCode);
+
+    const bool down = (msg.message == WM_KEYDOWN || msg.message == WM_SYSKEYDOWN);
+    if (!down) {
+        return dispatchEditorKeyUp(vk, keyCode, modifiers);
+    }
+
+    HWND topWnd = GetAncestor(m_rootHwnd, GA_ROOT);
+    if (!topWnd || GetActiveWindow() != topWnd) return false;
+
+    HWND focusHwnd = GetFocus();
+    const bool childFocused = focusHwnd && IsChild(m_pluginHostHwnd, focusHwnd);
+    if (!childFocused) {
+        if (!m_editorKeyboardFocused) return false;
+        if (focusHwnd && (focusHwnd == m_rootHwnd || IsChild(m_rootHwnd, focusHwnd)))
+            return false;
+        // Do not steal input if a DAW text field inside the same top-level window holds focus.
+        if (focusHwnd && focusHwnd != topWnd && !IsChild(focusHwnd, m_rootHwnd) &&
+            (SendMessageW(focusHwnd, WM_GETDLGCODE, 0, 0) & (DLGC_HASSETSEL | DLGC_WANTCHARS)))
+            return false;
+    } else {
+        // Leave plain printable keys on focused native text controls to TranslateMessage so
+        // international dead keys and IME composition continue to work natively.
+        if (!(modifiers & (kCommandKey | kAlternateKey)) && !isSpecialEditorKey(vk))
+            return false;
+    }
+
+    return dispatchEditorKeyDown(vk, key, keyCode, modifiers);
+}
+
+LRESULT CALLBACK FLBridgePlugView::GetMsgHookProc(int code, WPARAM wParam, LPARAM lParam) {
+    if (code == HC_ACTION && (wParam & PM_REMOVE) && lParam && !gInEditorKeyDispatch) {
+        MSG* msg = reinterpret_cast<MSG*>(lParam);
+        switch (msg->message) {
+            case WM_LBUTTONDOWN:
+            case WM_RBUTTONDOWN:
+            case WM_MBUTTONDOWN:
+            case WM_XBUTTONDOWN:
+            case WM_NCLBUTTONDOWN: {
+                const auto views = gThreadEditorViews;
+                for (FLBridgePlugView* view : views)
+                    if (view) view->onHookMouseDown(msg->hwnd);
+                break;
+            }
+            case WM_KEYDOWN:
+            case WM_SYSKEYDOWN:
+            case WM_KEYUP:
+            case WM_SYSKEYUP: {
+                const UINT vk = static_cast<UINT>(msg->wParam);
+                if (!isPureModifierVk(vk)) {
+                    const auto views = gThreadEditorViews;
+                    for (auto it = views.rbegin(); it != views.rend(); ++it) {
+                        if (*it && (*it)->handleHookKeyMessage(*msg)) {
+                            msg->message = WM_NULL;
+                            msg->wParam = 0;
+                            msg->lParam = 0;
+                            break;
+                        }
+                    }
+                }
+                break;
+            }
+            default:
+                break;
+        }
+    }
+    return CallNextHookEx(nullptr, code, wParam, lParam);
+}
+
 tresult PLUGIN_API FLBridgePlugView::onKeyDown(char16 key, int16 keyCode, int16 modifiers) {
-    if (!usesNativeEditorKeyboard()) return kResultFalse;
-    return m_editorKeyboard.keyDown(m_pluginHostHwnd, key, keyCode, modifiers,
-        m_flInstance->wantsEditorKeyboardInput()) ? kResultTrue : kResultFalse;
+    modifiers = normalizeHostModifiers(modifiers);
+    const UINT vk = Win32EditorKeyboard::virtualKey(key, keyCode);
+    return dispatchEditorKeyDown(vk, key, keyCode, modifiers) ? kResultTrue : kResultFalse;
 }
 
 tresult PLUGIN_API FLBridgePlugView::onKeyUp(char16 key, int16 keyCode, int16 modifiers) {
-    if (!usesNativeEditorKeyboard()) return kResultFalse;
-    return m_editorKeyboard.keyUp(m_pluginHostHwnd, key, keyCode, modifiers) ? kResultTrue : kResultFalse;
+    modifiers = normalizeHostModifiers(modifiers);
+    const UINT vk = Win32EditorKeyboard::virtualKey(key, keyCode);
+    return dispatchEditorKeyUp(vk, keyCode, modifiers) ? kResultTrue : kResultFalse;
 }
 
 tresult PLUGIN_API FLBridgePlugView::onFocus(TBool state) {
-    if (!state) m_editorKeyboard.reset();
-    if (usesNativeEditorKeyboard())
-        m_flInstance->setEditorFocus(state != 0);
+    setNativeEditorFocus(state != 0);
     return kResultOk;
 }
 
@@ -611,6 +875,8 @@ tresult PLUGIN_API FLBridgePlugView::attached(void* parent, FIDString type) {
 
         int pw = 900, ph = 600;
         if (m_flInstance->attachEditorToNSView((void*)m_pluginHostHwnd, pw, ph)) {
+            m_lastPluginTargetHwnd = GetWindow(m_pluginHostHwnd, GW_CHILD);
+            setNativeEditorFocus(true);
             layoutSubviews(pw, ph);
             if (m_plugFrame) {
                 ViewRect vr{};
@@ -620,11 +886,15 @@ tresult PLUGIN_API FLBridgePlugView::attached(void* parent, FIDString type) {
         }
     }
 
+    registerKeyboardHook();
     SetTimer(m_rootHwnd, kTimerIdIdle, 16, nullptr);
     return kResultOk;
 }
 
 tresult PLUGIN_API FLBridgePlugView::removed() {
+    unregisterKeyboardHook();
+    m_editorKeyboardFocused = false;
+    m_lastPluginTargetHwnd = nullptr;
     m_editorKeyboard.reset();
     if (!m_rootHwnd && !m_windowClassModule && !m_toolbar && !m_gdiplusToken) return kResultOk;
     if (m_toolbar) m_toolbar->closeMenu();
