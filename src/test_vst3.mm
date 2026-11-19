@@ -843,7 +843,7 @@ static void verifyPresetPicker(NSWindow* window, IEditController* controller, Pa
             CHECK(std::abs(expected.blueComponent - actual.blueComponent) < 0.015);
         }
     }
-    NSView* hint = picker.superview.subviews[5];
+    NSView* hint = picker.superview.subviews[flbr::kBridgeHintControl];
     CHECK(std::abs(NSMinY(hint.frame) - NSMinY(picker.frame) - 1) < 0.01);
     const double level = controller->getParamNormalized(outputID);
     const auto clickPicker = [&] {
@@ -1029,7 +1029,7 @@ static void verifyMasterVolume(const char* screenshotDirectory) {
             [knob mouseDown:reset];
             CHECK(controller->getParamNormalized(controlID) == defaultValue);
             CHECK(!handler.editing);
-            NSView* hintView = knob.superview.subviews[5];
+            NSView* hintView = knob.superview.subviews[flbr::kBridgeHintControl];
             CHECK([hintView isKindOfClass:NSTextField.class]);
             NSTextField* hint = (NSTextField*)hintView;
             const size_t editsBeforeHover = handler.edits.size();
@@ -1163,6 +1163,8 @@ static void checkBridgeEditorLayout(NSWindow* window, int width, int height, boo
     CHECK(std::lround(toolbar.frame.size.width) == width);
     CHECK(std::lround(toolbar.frame.size.height) == layout.height);
     CHECK(toolbar.subviews.count == flbr::kBridgeToolbarControlCount);
+    NSView* save = toolbar.subviews[flbr::kBridgeSavePresetControl];
+    CHECK([save.accessibilityLabel isEqualToString:@"Save preset as..."]);
     for (NSView* control in toolbar.subviews) CHECK(NSContainsRect(toolbar.bounds, control.frame));
     CHECK(std::lround(editor.frame.size.width) == width);
     CHECK(std::lround(editor.frame.size.height) == height);
@@ -2711,7 +2713,7 @@ static void verifyNativeVSTHoverHelp() {
                 NSView* hit = [window.contentView hitTest:center];
                 CHECK(hit == control || [hit isDescendantOf:control]);
             }
-            NSView* label = picker.superview.subviews[5];
+            NSView* label = picker.superview.subviews[flbr::kBridgeHintControl];
             CHECK([label isKindOfClass:NSTextField.class]);
             NSTextField* hint = (NSTextField*)label;
             ViewRect size{};

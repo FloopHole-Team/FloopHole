@@ -338,6 +338,43 @@ bool FLPluginScanner::isNativePresetFile(const std::string& path) {
            ext == ".sf2" || ext == ".dwp" || ext == ".dwb";
 }
 
+static FLPresetEntry makePresetEntry(const fs::path& file, fs::path relative) {
+    relative.replace_extension();
+    const auto noExtension = relative.generic_u8string();
+    const auto slash = noExtension.find('/');
+    FLPresetEntry preset;
+    preset.fullPath = file.u8string();
+    preset.name = slash == std::string::npos ? noExtension : noExtension.substr(slash + 1);
+    preset.category = slash == std::string::npos ? "" : noExtension.substr(0, slash);
+    preset.displayName = preset.category.empty() ? preset.name : preset.category + " / " + preset.name;
+    return preset;
+}
+
+int FLPluginScanner::registerSavedPreset(int pluginIndex, const std::string& path) {
+    std::lock_guard<std::recursive_mutex> lock(m_scanMutex);
+    if (pluginIndex < 0 || static_cast<size_t>(pluginIndex) >= m_plugins.size() || !m_plugins[pluginIndex].available)
+        return -1;
+    auto& entry = m_plugins[pluginIndex];
+    const auto file = fs::u8path(path).lexically_normal().make_preferred();
+    for (size_t i = 0; i < entry.presets.size(); ++i) {
+        if (fs::u8path(entry.presets[i].fullPath).lexically_normal() == file)
+            return static_cast<int>(i);
+    }
+
+    auto relative = file.filename();
+    for (uint8_t index : {PI_User, PI_Factory}) {
+        const auto root = fs::u8path(getPluginPresetPath(entry, index)).lexically_normal();
+        const auto candidate = file.lexically_relative(root);
+        if (!candidate.empty() && *candidate.begin() != "..") {
+            relative = candidate;
+            break;
+        }
+    }
+    // Keep existing indices stable for other instances and saved VST state.
+    entry.presets.push_back(makePresetEntry(file, relative));
+    return static_cast<int>(entry.presets.size() - 1);
+}
+
 void FLPluginScanner::scanPresetsForPlugin(FLPluginEntry& entry) const {
     for (uint8_t index : {PI_User, PI_Factory}) {
         const auto root = fs::u8path(getPluginPresetPath(entry, index));
@@ -354,16 +391,7 @@ void FLPluginScanner::scanPresetsForPlugin(FLPluginEntry& entry) const {
             const auto file = it->path();
             const auto ext = extensionOf(file.u8string());
             if (ext != ".fst" && !isNativePresetFile(entry.name, file.u8string())) continue;
-            auto relative = file.lexically_relative(root);
-            relative.replace_extension();
-            const auto noExtension = relative.generic_u8string();
-            const auto slash = noExtension.find('/');
-            FLPresetEntry preset;
-            preset.fullPath = file.u8string();
-            preset.name = slash == std::string::npos ? noExtension : noExtension.substr(slash + 1);
-            preset.category = slash == std::string::npos ? "" : noExtension.substr(0, slash);
-            preset.displayName = preset.category.empty() ? preset.name : preset.category + " / " + preset.name;
-            entry.presets.push_back(std::move(preset));
+            entry.presets.push_back(makePresetEntry(file, file.lexically_relative(root)));
         }
         if (error) fprintf(stderr, "FloopHole: cannot scan presets in %s: %s\n",
                            root.u8string().c_str(), error.message().c_str());

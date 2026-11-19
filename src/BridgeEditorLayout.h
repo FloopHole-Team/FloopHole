@@ -7,8 +7,11 @@
 namespace flbr {
 
 constexpr int kBridgeResizeFooterHeight = 14;
-constexpr size_t kBridgeToolbarControlCount = 7;
-constexpr size_t kBridgeMasterVolumeControl = 6;
+constexpr size_t kBridgeToolbarControlCount = 8;
+constexpr size_t kBridgeLoadPresetControl = 4;
+constexpr size_t kBridgeSavePresetControl = 5;
+constexpr size_t kBridgeHintControl = 6;
+constexpr size_t kBridgeMasterVolumeControl = 7;
 
 struct BridgeToolbarLayout {
     struct Rect { int x, y, width, height; };
@@ -19,8 +22,8 @@ struct BridgeToolbarLayout {
         width = std::max(1, width);
         const int padding = std::min(6, (width - 1) / 2);
         const int available = width - padding * 2;
-        constexpr std::array<int, kBridgeMasterVolumeControl> minimum{38, 180, 28, 28, 34, 200};
-        constexpr std::array<bool, kBridgeMasterVolumeControl> flexible{false, true, false, false, false, true};
+        constexpr std::array<int, kBridgeMasterVolumeControl> minimum{38, 180, 28, 28, 34, 34, 200};
+        constexpr std::array<bool, kBridgeMasterVolumeControl> flexible{false, true, false, false, false, false, true};
         BridgeToolbarLayout layout;
         const int knobWidth = std::min(40, available);
         layout.controls[kBridgeMasterVolumeControl] = {width - padding - knobWidth, 8, knobWidth, 38};
@@ -35,6 +38,9 @@ struct BridgeToolbarLayout {
                 const int itemWidth = std::min(minimum[last], rowAvailable);
                 const int next = used + (last > first ? 6 : 0) + itemWidth;
                 if (last > first && next > rowAvailable) break;
+                if (last == kBridgeLoadPresetControl && last > first &&
+                    available >= minimum[last] + 6 + minimum[kBridgeSavePresetControl] &&
+                    next + 6 + minimum[kBridgeSavePresetControl] > rowAvailable) break;
                 used = next;
                 growing += flexible[last] ? 1 : 0;
                 ++last;

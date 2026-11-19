@@ -12,6 +12,11 @@ Building FloopHole does not require FL Studio. **Using it requires a local,
 licensed FL Studio installation and the appropriate licenses for the plugins
 you use.** FL Studio and its plugins are not downloaded or bundled by this project.
 
+To save the current plugin sound or effect settings, click the diskette next to
+**Load preset**. **Save preset as...** opens the active plugin's user preset folder.
+Choose a filename to save an `.fst` and select it immediately in the preset
+dropdown. Presets saved in the default folder are found again on restart.
+
 ## License and legal notices
 
 FloopHole's original code is released under the [MIT License](./LICENSE).
@@ -100,10 +105,26 @@ With a local FL Studio installation, run the loaded-VST regressions:
 cmake --build build --target FloopHole test_vst3 --parallel
 build/test_vst3 --native-hover-help
 build/test_vst3 --edison-vst-poll
+build/test_vst3 --notebook-keyboard
+build/test_vst3 --notebook-appkit-keyboard
+build/test_vst3 --notebook-caret
 ```
 
 These check visible hover-help text and native Edison hover/leave state using
-the VST's real idle timer. They do not replace checking the editor in the DAW.
+the VST's real idle timer, plus Notebook typing/editing through host key
+callbacks and AppKit responders, saved-state restoration, and duplicate-delivery
+protection when a host invokes both keyboard APIs. They do not replace checking
+the editor in the DAW.
+
+Notebook typing/editing supports Cocoa responder events (used by Live) as well
+as VST key callbacks, only while a notebook writing surface has focus.
+Native activation notifications restore the blinking insertion caret after
+selection, refocusing and reopening. The caret regression checks thin-bar pixel
+changes in the native canvas across multiple blink cycles; it selects Metal
+only within the test process and does not change FL Studio's saved preferences.
+Fruity HTML Notebook is an
+[HTML viewer](https://www.image-line.com/fl-studio-learning/fl-studio-online-manual/html/plugins/Fruity%20HTML%20NoteBook.htm),
+not a text editor: load an externally edited HTML document with its file button.
 
 ## Build on Windows
 

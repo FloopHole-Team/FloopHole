@@ -263,6 +263,65 @@ static void renderEffect(void* self, float* source, float* destination, int32_t 
 }
 
 struct FLPluginInstanceTestAccess {
+    static void testPresetSave(const fs::path& directory) {
+        FLPluginInstance instance(false);
+        FakePlugin fake;
+        attach(instance, fake);
+        instance.m_currentPluginIndex = 0;
+        instance.m_pluginName = "Test Effect";
+        FLPluginEntry entry;
+        entry.name = instance.m_pluginName;
+        entry.category = "Effect";
+        entry.isGenerator = false;
+        entry.presetsScanned = true;
+        entry.presets.push_back({"Existing", "", "Existing", (directory / "Existing.fst").u8string()});
+        FLPluginScannerTestAccess::setPlugins({entry});
+        instance.m_fnSaveRestoreState = [](void* self, void* stream, bool save) {
+            auto& effect = *static_cast<FakePlugin*>(self);
+            // Exercise a state event whose length needs more than one byte.
+            int32_t state[40]{};
+            if (save) {
+                if (!effect.values[0]) return;
+                state[39] = effect.values[0];
+                CHECK(MemoryFruityStream::Write(stream, state, sizeof(state), nullptr) == 0);
+            } else {
+                CHECK(MemoryFruityStream::Read(stream, state, sizeof(state), nullptr) == 0);
+                effect.values[0] = state[39];
+            }
+        };
+        auto& scanner = FLPluginScanner::getInstance();
+        const auto root = fs::u8path(instance.preparePresetSaveDirectory());
+        CHECK(root == fs::u8path(scanner.getPluginPresetPath(entry, PI_User)));
+        CHECK(fs::is_directory(root));
+        const auto file = root / fs::u8path("Custom \xC3\xA9.FST");
+        fake.values[0] = 1234;
+        CHECK(instance.savePresetToFile(file.u8string()));
+        CHECK(instance.getCurrentPresetIndex() == 1);
+        const auto presets = scanner.getPlugins()[0].presets;
+        CHECK(presets.size() == 2 && presets[0].displayName == "Existing");
+        CHECK(presets[1].displayName == "Custom \xC3\xA9");
+        std::ifstream input(file, std::ios::binary);
+        const std::vector<uint8_t> bytes((std::istreambuf_iterator<char>(input)), {});
+        input.close();
+        std::vector<uint8_t> state;
+        std::string name;
+        CHECK(ExtractFstPluginState(bytes.data(), bytes.size(), state, &name));
+        CHECK(name == entry.name && state.size() == 160);
+        entry.presets.clear();
+        FLPluginScannerTestAccess::scan(entry);
+        CHECK(entry.presets.size() == 1 && entry.presets[0].fullPath == presets[1].fullPath);
+
+        fake.values[0] = 5678;
+        CHECK(instance.savePresetToFile(file.u8string()));
+        CHECK(scanner.getPlugins()[0].presets.size() == 2);
+        fake.values[0] = 0;
+        CHECK(!instance.savePresetToFile(file.u8string()));
+        CHECK(instance.loadPreset(1) && fake.values[0] == 5678);
+        CHECK(!instance.savePresetToFile((directory / "Missing" / "Patch.fst").u8string()));
+        CHECK(instance.getCurrentPresetIndex() == 1 && scanner.getPlugins()[0].presets.size() == 2);
+        FLPluginScannerTestAccess::setPlugins({});
+    }
+
     static void attach(FLPluginInstance& instance, FakePlugin& fake) {
         instance.m_plug = &fake;
         instance.m_numParams = 7;
@@ -1318,16 +1377,21 @@ static void testBridgeToolbarLayout() {
         CHECK(layout.controls[kBridgeMasterVolumeControl].x +
             layout.controls[kBridgeMasterVolumeControl].width == width - padding);
         CHECK(layout.controls[kBridgeMasterVolumeControl].y == 8);
-        if (width >= 212) CHECK(layout.controls[5].width >= 200);
+        if (width >= 212) CHECK(layout.controls[kBridgeHintControl].width >= 200);
+        if (width >= 86) {
+            const auto& load = layout.controls[kBridgeLoadPresetControl];
+            const auto& save = layout.controls[kBridgeSavePresetControl];
+            CHECK(load.y == save.y && load.x + load.width + 6 == save.x);
+        }
         if (width >= 100) CHECK(layout.controls[0].width == 38 && layout.controls[0].height == 38);
         CHECK(bridgeEditorHeight(width, 55, false) == 55 + layout.height);
         CHECK(bridgeEditorHeight(width, 55, true) == 55 + layout.height + kBridgeResizeFooterHeight);
     }
-    CHECK(BridgeToolbarLayout::compute(595).height == 86);
-    CHECK(BridgeToolbarLayout::compute(596).height == 54);
-    const auto narrow = BridgeToolbarLayout::compute(596);
+    CHECK(BridgeToolbarLayout::compute(635).height == 86);
+    CHECK(BridgeToolbarLayout::compute(636).height == 54);
+    const auto narrow = BridgeToolbarLayout::compute(636);
     const auto wide = BridgeToolbarLayout::compute(1200);
-    for (size_t flexible : {size_t{1}, size_t{5}})
+    for (size_t flexible : {size_t{1}, kBridgeHintControl})
         CHECK(wide.controls[flexible].width > narrow.controls[flexible].width);
 }
 
@@ -1393,6 +1457,7 @@ int main() {
     flbr::FLPluginInstanceTestAccess::testSampleServices(instance, fake, directory);
     flbr::testStateStream();
     flbr::testPresetParsing();
+    flbr::FLPluginInstanceTestAccess::testPresetSave(directory);
     instance.unloadPlugin();
     CHECK(instance.getNumInternalPresets() == 0);
     CHECK(fs::remove_all(directory) > 0);

@@ -7,6 +7,7 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#include "BridgeEditorLayout.h"
 #include "ToolbarTheme.h"
 #include "LogoRenderer.h"
 #include "Win32WindowClasses.h"
@@ -22,11 +23,12 @@ public:
         std::function<void()> previous;
         std::function<void()> next;
         std::function<void()> load;
+        std::function<void()> save;
     };
     WindowsToolbar(HWND parent, Actions actions);
     ~WindowsToolbar();
     bool attach();
-    const std::array<HWND, 6>& controls() const { return m_controls; }
+    const auto& controls() const { return m_controls; }
     void setPresets(const std::vector<FLPresetEntry>& presets, int selected);
     void setHint(const std::string& hint);
     void closeMenu();
@@ -51,8 +53,8 @@ private:
     HWND m_menu = nullptr;
     HINSTANCE m_module = nullptr;
     Actions m_actions;
-    std::array<HWND, 6> m_controls{};
-    std::array<Control, 6> m_data{};
+    std::array<HWND, kBridgeMasterVolumeControl> m_controls{};
+    std::array<Control, kBridgeMasterVolumeControl> m_data{};
     std::vector<PresetMenuItem> m_items;
     std::vector<std::wstring> m_wideItems;
     std::vector<std::wstring> m_lowerItems;

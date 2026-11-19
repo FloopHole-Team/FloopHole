@@ -1,12 +1,90 @@
 #include "FLPluginInstance.h"
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <filesystem>
+#include <fstream>
 #include <numeric>
 #include "FLPathManager.h"
 
 namespace flbr {
+namespace fs = std::filesystem;
+
+std::string FLPluginInstance::preparePresetSaveDirectory() const {
+    if (!isLoaded()) return {};
+    auto& scanner = FLPluginScanner::getInstance();
+    const auto plugins = scanner.getPlugins();
+    const int index = getCurrentPluginIndex();
+    if (index < 0 || static_cast<size_t>(index) >= plugins.size()) return {};
+    const auto path = scanner.getPluginPresetPath(plugins[index], PI_User);
+    if (path.empty()) return {};
+    std::error_code error;
+    fs::create_directories(fs::u8path(path), error);
+    if (error) {
+        fprintf(stderr, "FloopHole: cannot create preset directory %s: %s\n", path.c_str(), error.message().c_str());
+        return {};
+    }
+    return path;
+}
+
+bool FLPluginInstance::savePresetToFile(const std::string& path) {
+    std::lock_guard<std::recursive_mutex> lock(m_mutex);
+    const auto destination = fs::u8path(path);
+    auto extension = destination.extension().u8string();
+    std::transform(extension.begin(), extension.end(), extension.begin(),
+        [](char c) { return c >= 'A' && c <= 'Z' ? c + ('a' - 'A') : c; });
+    if (!destination.is_absolute() || extension != ".fst" || m_currentPluginIndex < 0) return false;
+
+    std::vector<uint8_t> state;
+    if (!savePluginState(state) || state.empty()) return false;
+
+    // Native FST header (format 0x30), followed by plugin name and state events.
+    std::vector<uint8_t> bytes{'F','L','h','d', 6,0,0,0, 0x30,0,1,0,96,0, 'F','L','d','t', 0,0,0,0};
+    const auto eventHeader = [&](uint8_t id, uint32_t length) {
+        bytes.push_back(id);
+        while (length >= 128) {
+            bytes.push_back(static_cast<uint8_t>(length | 0x80));
+            length >>= 7;
+        }
+        bytes.push_back(static_cast<uint8_t>(length));
+    };
+    if (state.size() > UINT32_MAX - m_pluginName.size() - 13) return false;
+    eventHeader(201, static_cast<uint32_t>(m_pluginName.size() + 1));
+    bytes.insert(bytes.end(), m_pluginName.begin(), m_pluginName.end());
+    bytes.push_back(0);
+    eventHeader(213, static_cast<uint32_t>(state.size()));
+    bytes.insert(bytes.end(), state.begin(), state.end());
+    const auto dataLength = static_cast<uint32_t>(bytes.size() - 22);
+    for (int i = 0; i < 4; ++i) bytes[18 + i] = static_cast<uint8_t>(dataLength >> (8 * i));
+
+    // Stage beside the destination so a failed write cannot truncate an existing preset.
+    const auto staging = destination.parent_path() / (".floophole-save-" +
+        std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+    std::error_code error;
+    if (!fs::create_directory(staging, error)) {
+        fprintf(stderr, "FloopHole: cannot stage preset %s: %s\n", path.c_str(),
+                error ? error.message().c_str() : "temporary directory already exists");
+        return false;
+    }
+    const auto temporary = staging / "preset.tmp";
+    std::ofstream output(temporary, std::ios::binary);
+    output.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+    output.close();
+    if (output) fs::rename(temporary, destination, error);
+    const bool saved = output && !error;
+    if (!saved) {
+        fprintf(stderr, "FloopHole: cannot write preset %s: %s\n", path.c_str(),
+                error ? error.message().c_str() : "stream write failed");
+    }
+    std::error_code cleanupError;
+    fs::remove(temporary, cleanupError);
+    fs::remove(staging, cleanupError);
+    if (!saved) return false;
+
+    m_currentPresetIndex = FLPluginScanner::getInstance().registerSavedPreset(m_currentPluginIndex, path);
+    return m_currentPresetIndex >= 0;
+}
 
 bool FLPluginInstance::setMasterVolume(double value) {
     if (!std::isfinite(value) || value < 0 || value > 1) {

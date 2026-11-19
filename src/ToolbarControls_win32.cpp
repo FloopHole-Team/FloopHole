@@ -70,11 +70,12 @@ bool WindowsToolbar::attach() {
     }
     m_module = windowClasses().acquire();
     if (!m_module) return false;
-    const wchar_t* names[] = {L"FloopHole", L"Preset", L"Previous preset", L"Next preset", L"Load preset", L"Ready"};
+    const wchar_t* names[] = {L"FloopHole", L"Preset", L"Previous preset", L"Next preset",
+        L"Load preset", L"Save preset as...", L"Ready"};
     for (size_t i = 0; i < m_controls.size(); ++i) {
         m_data[i] = {this, static_cast<int>(i), false, false};
         m_controls[i] = CreateWindowExW(0, L"FloopHoleToolbarControl", names[i],
-            WS_CHILD | WS_VISIBLE | (i >= 1 && i <= 4 ? WS_TABSTOP : 0), 0, 0, 38, 38,
+            WS_CHILD | WS_VISIBLE | (i >= 1 && i <= kBridgeSavePresetControl ? WS_TABSTOP : 0), 0, 0, 38, 38,
             m_parent, nullptr, m_module, &m_data[i]);
         if (!m_controls[i]) {
             fprintf(stderr, "FloopHole: toolbar control creation failed (%lu)\n", GetLastError());
@@ -108,15 +109,16 @@ void WindowsToolbar::setPresets(const std::vector<FLPresetEntry>& presets, int s
 
 void WindowsToolbar::setHint(const std::string& hint) {
     m_hint = wide(hint);
-    SetWindowTextW(m_controls[5], m_hint.c_str());
-    InvalidateRect(m_controls[5], nullptr, FALSE);
+    SetWindowTextW(m_controls[kBridgeHintControl], m_hint.c_str());
+    InvalidateRect(m_controls[kBridgeHintControl], nullptr, FALSE);
 }
 
 void WindowsToolbar::activate(int control) {
     if (control == 1) openMenu();
     else if (control == 2 && m_actions.previous) m_actions.previous();
     else if (control == 3 && m_actions.next) m_actions.next();
-    else if (control == 4 && m_actions.load) m_actions.load();
+    else if (control == kBridgeLoadPresetControl && m_actions.load) m_actions.load();
+    else if (control == kBridgeSavePresetControl && m_actions.save) m_actions.save();
 }
 
 void WindowsToolbar::paintControl(HWND window, int index, bool hover, bool pressed) {
@@ -139,7 +141,7 @@ void WindowsToolbar::paintControl(HWND window, int index, bool hover, bool press
                     Gdiplus::Bitmap logo(size, size, m_logo.stride, PixelFormat32bppPARGB, m_logo.pixels.data());
                     graphics.DrawImage(&logo, (width - size) / 2, (height - size) / 2);
                 }
-            } else if (index == 5) {
+            } else if (index == kBridgeHintControl) {
                 text(graphics, m_hint, Gdiplus::RectF(0, 0, width, height), ToolbarTheme::muted, 11);
             } else {
                 Gdiplus::GraphicsPath path;
@@ -156,11 +158,18 @@ void WindowsToolbar::paintControl(HWND window, int index, bool hover, bool press
                     text(graphics, m_title, Gdiplus::RectF(9, 0, std::max(0, width - 30), height), ToolbarTheme::text);
                     Gdiplus::PointF arrow[] = {{width - 16.0f, y - 2}, {width - 8.0f, y - 2}, {width - 12.0f, y + 2}};
                     graphics.FillPolygon(&foreground, arrow, 3);
-                } else if (index == 4) {
+                } else if (index == kBridgeLoadPresetControl) {
                     Gdiplus::PointF folder[] = {{x - 6, y + 4}, {x + 6, y + 4}, {x + 6, y - 3},
                         {x - 1, y - 3}, {x - 3, y - 5}, {x - 6, y - 5}, {x - 6, y + 4}};
                     Gdiplus::Pen pen(color(ToolbarTheme::text), 1);
                     graphics.DrawLines(&pen, folder, 7);
+                } else if (index == kBridgeSavePresetControl) {
+                    Gdiplus::PointF disk[] = {{x - 6, y - 6}, {x + 3, y - 6}, {x + 6, y - 3},
+                        {x + 6, y + 6}, {x - 6, y + 6}, {x - 6, y - 6}};
+                    Gdiplus::Pen pen(color(ToolbarTheme::text), 1);
+                    graphics.DrawLines(&pen, disk, 6);
+                    graphics.DrawRectangle(&pen, x - 3, y + 1, 6.0f, 5.0f);
+                    graphics.DrawLine(&pen, x + 1, y - 5, x + 1, y - 2);
                 } else {
                     const float direction = index == 2 ? -1 : 1;
                     Gdiplus::PointF arrow[] = {{x + 3 * direction, y},
@@ -191,7 +200,7 @@ LRESULT CALLBACK WindowsToolbar::controlProc(HWND window, UINT message, WPARAM w
         case WM_PAINT: data->owner->paintControl(window, data->index, data->hover, data->pressed); return 0;
         case WM_GETDLGCODE: return DLGC_WANTARROWS;
         case WM_LBUTTONDOWN:
-            if (data->index < 1 || data->index > 4) return 0;
+            if (data->index < 1 || data->index > kBridgeSavePresetControl) return 0;
             SetFocus(window); SetCapture(window); data->pressed = true; InvalidateRect(window, nullptr, FALSE); return 0;
         case WM_LBUTTONUP: {
             const bool pressed = data->pressed;

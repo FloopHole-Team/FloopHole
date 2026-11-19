@@ -79,6 +79,18 @@ static void drawSurface(NSRect bounds, BOOL hover, BOOL pressed) {
         [icon closePath];
         icon.lineWidth = 1;
         [icon stroke];
+    } else if (_icon == 3) {
+        [icon moveToPoint:NSMakePoint(x - 6, y + 6)];
+        [icon lineToPoint:NSMakePoint(x + 3, y + 6)];
+        [icon lineToPoint:NSMakePoint(x + 6, y + 3)];
+        [icon lineToPoint:NSMakePoint(x + 6, y - 6)];
+        [icon lineToPoint:NSMakePoint(x - 6, y - 6)];
+        [icon closePath];
+        [icon appendBezierPathWithRect:NSMakeRect(x - 3, y - 6, 6, 5)];
+        [icon moveToPoint:NSMakePoint(x + 1, y + 5)];
+        [icon lineToPoint:NSMakePoint(x + 1, y + 2)];
+        icon.lineWidth = 1;
+        [icon stroke];
     } else {
         const CGFloat direction = _icon == 0 ? -1 : 1;
         [icon moveToPoint:NSMakePoint(x + 3 * direction, y)];

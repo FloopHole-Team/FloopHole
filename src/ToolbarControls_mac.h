@@ -15,7 +15,7 @@ inline NSColor* themeColor(uint32_t rgb) {
 @end
 
 @interface FloopHoleButton : NSButton
-@property(nonatomic) int icon; // 0 previous, 1 next, 2 folder
+@property(nonatomic) int icon; // 0 previous, 1 next, 2 folder, 3 diskette
 @end
 
 @interface FloopHolePresetPicker : NSControl {

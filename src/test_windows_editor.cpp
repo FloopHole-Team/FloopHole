@@ -368,11 +368,15 @@ static void testPresetMenuInteractions() {
     CHECK(parent);
 
     int activatedPreset = -1;
+    int saved = 0;
     WindowsToolbar::Actions actions{};
     actions.preset = [&](int p) { activatedPreset = p; };
+    actions.save = [&] { ++saved; };
 
     auto toolbar = std::make_unique<WindowsToolbar>(parent, actions);
     CHECK(toolbar->attach());
+    SendMessageW(toolbar->controls()[kBridgeSavePresetControl], WM_KEYDOWN, VK_RETURN, 0);
+    CHECK(saved == 1);
 
     std::vector<FLPresetEntry> presets;
     for (int i = 0; i < 40; ++i) {

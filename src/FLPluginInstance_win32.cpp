@@ -544,7 +544,7 @@ bool FLPluginInstance::loadPresetFromFile(const std::string& fstPath) {
     if (FLPluginScanner::isFlexPackFile(fstPath)) return importFlexPack(fstPath);
     if (!m_plug || !m_fnSaveRestoreState) return false;
 
-    FILE* fp = fopen(fstPath.c_str(), "rb");
+    FILE* fp = _wfopen(std::filesystem::u8path(fstPath).c_str(), L"rb");
     if (!fp) return false;
     fseek(fp, 0, SEEK_END);
     long sz = ftell(fp);

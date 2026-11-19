@@ -76,6 +76,8 @@ public:
     bool loadInternalPreset(int presetIndex);
     std::string getInternalPresetName(int presetIndex);
     bool loadPresetFromFile(const std::string& fstPath);
+    std::string preparePresetSaveDirectory() const;
+    bool savePresetToFile(const std::string& path);
     bool loadNativePresetFromFile(const std::string& path);
     bool importFlexPack(const std::string& path);
     bool savePluginState(std::vector<uint8_t>& outState);

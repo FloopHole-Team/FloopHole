@@ -73,6 +73,7 @@ class FLBridgePlugView;
 - (void)onPrevPreset:(id)sender;
 - (void)onNextPreset:(id)sender;
 - (void)onLoadFstFile:(id)sender;
+- (void)onSaveFstFile:(id)sender;
 - (void)onIdleTimer:(NSTimer*)timer;
 @end
 
@@ -270,6 +271,7 @@ public:
     void selectPresetFromMenu(int presetIndex);
     void stepPreset(int delta);
     void promptLoadFstFile();
+    void promptSaveFstFile();
     void onTimerTick();
     void refreshToolbarState();
     void setHintText(const std::string& text);
@@ -436,6 +438,10 @@ private:
 
 - (void)onLoadFstFile:(id)sender {
     if (_plugView) _plugView->promptLoadFstFile();
+}
+
+- (void)onSaveFstFile:(id)sender {
+    if (_plugView) _plugView->promptSaveFstFile();
 }
 
 - (void)onIdleTimer:(NSTimer*)timer {
@@ -802,6 +808,13 @@ tresult PLUGIN_API FLBridgePlugView::attached(void* parent, FIDString type) {
         m_loadFstBtn = folder;
         [m_toolbarView addSubview:m_loadFstBtn];
 
+        FloopHoleButton* save = [[FloopHoleButton alloc] initWithFrame:NSZeroRect];
+        save.icon = 3;
+        save.target = m_target;
+        save.action = @selector(onSaveFstFile:);
+        save.toolTip = save.accessibilityLabel = @"Save preset as...";
+        [m_toolbarView addSubview:save];
+
         m_hintLabel = [NSTextField labelWithString:@"Ready"];
         [m_hintLabel setFont:[NSFont systemFontOfSize:11]];
         [m_hintLabel setTextColor:themeColor(ToolbarTheme::muted)];
@@ -814,7 +827,7 @@ tresult PLUGIN_API FLBridgePlugView::attached(void* parent, FIDString type) {
         m_volumeKnob.accessibilityLabel = isEffect() ? @"Effect mix" : @"Master volume";
         [m_toolbarView addSubview:m_volumeKnob];
         m_toolbarControls = @[logo, m_presetPopup, m_prevPresetBtn, m_nextPresetBtn,
-            m_loadFstBtn, m_hintLabel, m_volumeKnob];
+            m_loadFstBtn, save, m_hintLabel, m_volumeKnob];
         m_resizeGrip = [[FloopHoleResizeGrip alloc] initWithFrame:NSZeroRect];
         m_resizeGrip.plugView = this;
         m_resizeGrip.toolTip = @"Resize native plugin";
@@ -1106,6 +1119,38 @@ void FLBridgePlugView::promptLoadFstFile() {
         } else {
             setHintText("Could not load file. Check its format and permissions; existing packs are not overwritten.");
         }
+    }
+}
+
+void FLBridgePlugView::promptSaveFstFile() {
+    if (!m_flInstance || !m_flInstance->isLoaded()) {
+        setHintText("Load a plugin before saving a preset.");
+        return;
+    }
+    const int pluginIndex = m_flInstance->getCurrentPluginIndex();
+    const auto directory = m_flInstance->preparePresetSaveDirectory();
+    if (directory.empty()) {
+        setHintText("Could not open the plugin's user preset folder.");
+        return;
+    }
+    NSSavePanel* panel = [NSSavePanel savePanel];
+    panel.title = @"Save preset as...";
+    panel.allowedFileTypes = @[@"fst"];
+    panel.allowsOtherFileTypes = NO;
+    panel.extensionHidden = NO;
+    panel.canCreateDirectories = YES;
+    panel.nameFieldStringValue = @"New preset";
+    panel.directoryURL = [NSURL fileURLWithPath:[NSString stringWithUTF8String:directory.c_str()]
+                                   isDirectory:YES];
+    if ([panel runModal] != NSModalResponseOK) return;
+
+    NSString* path = panel.URL.path;
+    if (path.UTF8String && m_flInstance && m_flInstance->getCurrentPluginIndex() == pluginIndex &&
+        m_flInstance->savePresetToFile(path.UTF8String)) {
+        rebuildPresetMenu();
+        setHintText(std::string("Saved preset: ") + path.lastPathComponent.UTF8String);
+    } else {
+        setHintText("Could not save preset. Check the filename and folder permissions.");
     }
 }
 

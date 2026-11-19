@@ -112,6 +112,7 @@ public:
     void selectPresetFromMenu(int presetIndex);
     void stepPreset(int delta);
     void promptLoadFstFile();
+    void promptSaveFstFile();
     void onTimerTick();
     void refreshToolbarState();
     void setHintText(const std::string& text);
@@ -571,6 +572,7 @@ tresult PLUGIN_API FLBridgePlugView::attached(void* parent, FIDString type) {
     actions.previous = [this] { stepPreset(-1); };
     actions.next = [this] { stepPreset(1); };
     actions.load = [this] { promptLoadFstFile(); };
+    actions.save = [this] { promptSaveFstFile(); };
     m_toolbar = std::make_unique<WindowsToolbar>(m_rootHwnd, std::move(actions));
     if (!m_toolbar->attach()) {
         removed();
@@ -837,6 +839,50 @@ void FLBridgePlugView::promptLoadFstFile() {
         } else {
             setHintText("Could not load file. Check its format and permissions; existing packs are not overwritten.");
         }
+    }
+    PostMessageW(m_rootHwnd, WM_APP + 1, 0, 0);
+}
+
+void FLBridgePlugView::promptSaveFstFile() {
+    if (!m_flInstance || !m_flInstance->isLoaded()) {
+        setHintText("Load a plugin before saving a preset.");
+        return;
+    }
+    const int pluginIndex = m_flInstance->getCurrentPluginIndex();
+    const auto directory = m_flInstance->preparePresetSaveDirectory();
+    if (directory.empty()) {
+        setHintText("Could not open the plugin's user preset folder.");
+        return;
+    }
+    const auto initialDirectory = std::filesystem::u8path(directory);
+    const auto suggested = initialDirectory / L"New preset.fst";
+    wchar_t fileBuf[32768] = {};
+    if (suggested.native().size() >= sizeof(fileBuf) / sizeof(fileBuf[0])) {
+        setHintText("The plugin's user preset folder path is too long.");
+        return;
+    }
+    std::copy(suggested.native().begin(), suggested.native().end(), fileBuf);
+    OPENFILENAMEW dialog{};
+    dialog.lStructSize = sizeof(dialog);
+    dialog.hwndOwner = m_rootHwnd;
+    dialog.lpstrFilter = L"FL Studio Presets (*.fst)\0*.fst\0";
+    dialog.lpstrFile = fileBuf;
+    dialog.nMaxFile = sizeof(fileBuf) / sizeof(fileBuf[0]);
+    dialog.lpstrInitialDir = initialDirectory.c_str();
+    dialog.lpstrTitle = L"Save preset as...";
+    dialog.lpstrDefExt = L"fst";
+    dialog.Flags = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
+    if (GetSaveFileNameW(&dialog)) {
+        const std::filesystem::path path(fileBuf);
+        if (m_flInstance && m_flInstance->getCurrentPluginIndex() == pluginIndex &&
+            m_flInstance->savePresetToFile(path.u8string())) {
+            rebuildPresetMenu();
+            setHintText("Saved preset: " + path.filename().u8string());
+        } else {
+            setHintText("Could not save preset. Use a .fst filename in a writable folder.");
+        }
+    } else if (CommDlgExtendedError()) {
+        setHintText("Could not open the Save Preset dialog.");
     }
     PostMessageW(m_rootHwnd, WM_APP + 1, 0, 0);
 }

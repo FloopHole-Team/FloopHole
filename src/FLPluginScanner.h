@@ -55,6 +55,7 @@ public:
     std::string getDataPath(uint32_t id, uint8_t index) const;
     std::string getFlexDataPath(uint8_t index) const;
     std::string getPluginPresetPath(const FLPluginEntry& entry, uint8_t index = 1) const;
+    int registerSavedPreset(int pluginIndex, const std::string& path);
     static bool isNativePresetFile(const std::string& plugin, const std::string& path);
     static bool isNativePresetFile(const std::string& path);
     static bool isFlexPackFile(const std::string& path);
