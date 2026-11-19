@@ -5,6 +5,7 @@
 #include "FLPluginScanner.h"
 #include "FLPluginInstance.h"
 #include "BridgeEditorLayout.h"
+#include "FloopHoleAssets.h"
 #include "FLPathManager.h"
 
 #include "pluginterfaces/base/funknown.h"
@@ -40,6 +41,30 @@
 @end
 @implementation FLBridgeTestFileDrag
 @end
+
+static NSPasteboard* testClipboard;
+@interface NSPasteboard (FLBridgeTestClipboard)
++ (NSPasteboard*)flBridgeTestGeneralPasteboard;
+@end
+@implementation NSPasteboard (FLBridgeTestClipboard)
++ (NSPasteboard*)flBridgeTestGeneralPasteboard { return testClipboard; }
+@end
+
+struct ScopedTestClipboard {
+    ScopedTestClipboard() {
+        testClipboard = [NSPasteboard pasteboardWithUniqueName];
+        swap();
+    }
+    ~ScopedTestClipboard() {
+        swap();
+        [testClipboard releaseGlobally];
+        testClipboard = nil;
+    }
+    static void swap() {
+        method_exchangeImplementations(class_getClassMethod(NSPasteboard.class, @selector(generalPasteboard)),
+            class_getClassMethod(NSPasteboard.class, @selector(flBridgeTestGeneralPasteboard)));
+    }
+};
 
 // Matches Ableton Live's OPluginCocoaWindowDelegate, which does not implement
 // optional windowDidBecomeKey: or windowDidResignKey: selectors.
@@ -107,13 +132,14 @@ static void testNativeCursorPosition(NSPoint* point) {
 @end
 
 static NSURL* testOpenFile;
+static int testOpenFileCalls;
 @interface NSOpenPanel (FLBridgeTestOpenFile)
 - (NSModalResponse)flBridgeTestRunModal;
 - (NSArray<NSURL*>*)flBridgeTestURLs;
 - (NSURL*)flBridgeTestURL;
 @end
 @implementation NSOpenPanel (FLBridgeTestOpenFile)
-- (NSModalResponse)flBridgeTestRunModal { return NSModalResponseOK; }
+- (NSModalResponse)flBridgeTestRunModal { ++testOpenFileCalls; return NSModalResponseOK; }
 - (NSArray<NSURL*>*)flBridgeTestURLs { return @[testOpenFile]; }
 - (NSURL*)flBridgeTestURL { return testOpenFile; }
 @end
@@ -2462,6 +2488,7 @@ static void verifyNotebookCaret(NSView* writingView, NSView* editor) {
 }
 
 static void verifyNotebookKeyboard(const char* name, bool appKitKeys = false, bool caretProbe = false) {
+    ScopedTestClipboard clipboard;
     Method defaults = class_getInstanceMethod(NSUserDefaults.class, @selector(objectForKey:));
     Method testDefaults = class_getInstanceMethod(NSUserDefaults.class, @selector(flBridgeTestNotebookObjectForKey:));
     // Keep framebuffer readback local to the test process, without changing user preferences.
@@ -2494,6 +2521,32 @@ static void verifyNotebookKeyboard(const char* name, bool appKitKeys = false, bo
     [NSRunLoop.currentRunLoop runUntilDate:[NSDate dateWithTimeIntervalSinceNow:0.2]];
     NSView* editor = findNativeEditor(window.contentView);
     CHECK(editor);
+    NSView* logo = findPresetPicker(window.contentView).superview.subviews[0];
+    CHECK([logo.accessibilityLabel isEqualToString:@"About FloopHole"]);
+    CHECK([logo accessibilityPerformPress]);
+    NSWindow* about = nil;
+    for (NSWindow* candidate in NSApp.windows)
+        if ([candidate.title isEqualToString:@"About FloopHole"] && candidate.visible) about = candidate;
+    CHECK(about);
+    bool heading = false, version = false, repository = false, largerLogo = false;
+    for (NSView* control in about.contentView.subviews) {
+        if ([control isKindOfClass:NSTextField.class]) {
+            NSString* text = ((NSTextField*)control).stringValue;
+            heading |= [text isEqualToString:@"FloopHole"];
+            version |= [text isEqualToString:[@"Version " stringByAppendingString:
+                [NSString stringWithUTF8String:flbr::kFloopHoleVersion]]];
+        }
+        if ([control isKindOfClass:NSButton.class])
+            repository |= [((NSButton*)control).title isEqualToString:
+                [NSString stringWithUTF8String:flbr::kFloopHoleRepository]];
+        if ([control.accessibilityRole isEqualToString:NSAccessibilityImageRole])
+            largerLogo |= control.frame.size.width > logo.frame.size.width;
+    }
+    CHECK(heading && version && repository && largerLogo);
+    [about close];
+    CHECK([logo accessibilityPerformPress] && about.visible);
+    [about close];
+    [window makeKeyAndOrderFront:nil];
     const auto containsText = [&](const TestMemoryStream& state, NSString* text) {
         const NSStringEncoding encoding = strcmp(name, "Fruity NoteBook 2") == 0 ? NSUTF16LittleEndianStringEncoding :
             NSUTF8StringEncoding;
@@ -2532,6 +2585,9 @@ static void verifyNotebookKeyboard(const char* name, bool appKitKeys = false, bo
             case KEY_LEFT: character = NSLeftArrowFunctionKey; nativeCode = kVK_LeftArrow; break;
         }
         if (key == u'R' || key == u'r') nativeCode = kVK_ANSI_R;
+        if (key == u'c') nativeCode = kVK_ANSI_C;
+        if (key == u'x') nativeCode = kVK_ANSI_X;
+        if (key == u'v') nativeCode = kVK_ANSI_V;
         NSEventModifierFlags flags = 0;
         if (modifiers & kCommandKey) flags |= NSEventModifierFlagCommand;
         if (modifiers & kShiftKey) flags |= NSEventModifierFlagShift;
@@ -2583,6 +2639,15 @@ static void verifyNotebookKeyboard(const char* name, bool appKitKeys = false, bo
     TestMemoryStream replaced;
     CHECK(component->getState(&replaced) == kResultOk);
     CHECK(containsText(replaced, @"Replacement") && !containsText(replaced, @"Second line"));
+    press(u'a', 0, kCommandKey);
+    press(u'c', 0, kCommandKey);
+    CHECK([[testClipboard stringForType:NSPasteboardTypeString] isEqualToString:@"Replacement"]);
+    press(u'x', 0, kCommandKey);
+    TestMemoryStream cut;
+    CHECK(component->getState(&cut) == kResultOk && !containsText(cut, @"Replacement"));
+    press(u'v', 0, kCommandKey);
+    TestMemoryStream pasted;
+    CHECK(component->getState(&pasted) == kResultOk && containsText(pasted, @"Replacement"));
     CHECK(view->onKeyDown(u'q', 0, kCommandKey) == kResultFalse);
     CHECK(view->onKeyUp(u'q', 0, kCommandKey) == kResultFalse);
     if (appKitKeys) CHECK(![(NSView*)window.firstResponder performKeyEquivalent:platformKeyEvent(true, u'q', 0, kCommandKey)]);
@@ -2600,12 +2665,15 @@ static void verifyNotebookKeyboard(const char* name, bool appKitKeys = false, bo
         CHECK(component->getState(&outside) == kResultOk);
         CHECK(containsText(outside, @"Replacement") && !containsText(outside, @"Replacementn"));
     }
+    CHECK([logo accessibilityPerformPress]);
     CHECK(view->removed() == kResultOk);
+    CHECK(!about.visible);
     typed.pos = 0;
     CHECK(component->setState(&typed) == kResultOk);
     CHECK(view->attached((__bridge void*)window.contentView, kPlatformTypeNSView) == kResultOk);
     editor = findNativeEditor(window.contentView);
     CHECK(editor);
+    [window makeKeyAndOrderFront:nil];
     clickText();
     if (caretProbe) verifyNotebookCaret((NSView*)window.firstResponder, editor);
     TestMemoryStream restored;
@@ -2775,7 +2843,8 @@ static void verifyNativeVSTHoverHelp() {
     fprintf(stderr, "Loaded VST3 native knob/button hover help and reopening passed\n");
 }
 
-static void verifyEdisonVSTPolling() {
+static void verifyEdisonVSTPolling(bool clipboardTest = false) {
+    ScopedTestClipboard clipboard;
     void* bundle = dlopen("./build/VST3/FloopHole.vst3/Contents/MacOS/FloopHole", RTLD_NOW);
     CHECK(bundle);
     auto entry = reinterpret_cast<BundleEntryFn>(dlsym(bundle, "bundleEntry"));
@@ -2822,6 +2891,57 @@ static void verifyEdisonVSTPolling() {
     }
     swapTestFilePanel();
     testOpenFile = nil;
+    if (clipboardTest) {
+        CHECK(testOpenFileCalls > 0);
+        [NSRunLoop.currentRunLoop runUntilDate:[NSDate dateWithTimeIntervalSinceNow:0.2]];
+        for (NSEventType type : {NSEventTypeLeftMouseDown, NSEventTypeLeftMouseUp})
+            [NSApp sendEvent:[NSEvent mouseEventWithType:type
+                location:[editor convertPoint:wave toView:nil] modifierFlags:0
+                timestamp:NSProcessInfo.processInfo.systemUptime windowNumber:window.windowNumber context:nil
+                eventNumber:2 clickCount:1 pressure:type == NSEventTypeLeftMouseDown ? 1 : 0]];
+        for (bool appKit : {false, true}) {
+            const auto press = [&](char16 key) {
+                const unsigned short code = key == u'a' ? kVK_ANSI_A : key == u'c' ? kVK_ANSI_C :
+                    key == u'x' ? kVK_ANSI_X : kVK_ANSI_V;
+                for (bool down : {true, false}) {
+                    if (appKit) {
+                        const unichar character = key;
+                        NSString* text = [NSString stringWithCharacters:&character length:1];
+                        NSEvent* event = [NSEvent keyEventWithType:down ? NSEventTypeKeyDown : NSEventTypeKeyUp
+                            location:NSZeroPoint modifierFlags:NSEventModifierFlagCommand
+                            timestamp:NSProcessInfo.processInfo.systemUptime windowNumber:window.windowNumber context:nil
+                            characters:text charactersIgnoringModifiers:text isARepeat:NO keyCode:code];
+                        [NSApp sendEvent:event];
+                    } else {
+                        CHECK((down ? view->onKeyDown(key, 0, kCommandKey) : view->onKeyUp(key, 0, kCommandKey))
+                            == kResultTrue);
+                    }
+                }
+            };
+            press(u'a');
+            const auto change = testClipboard.changeCount;
+            press(u'c');
+            CHECK(testClipboard.changeCount > change && testClipboard.types.count > 0);
+            NSPasteboardType audioType = testClipboard.types.firstObject;
+            NSData* audio = [testClipboard dataForType:audioType];
+            CHECK(audio.length > 0);
+            TestMemoryStream copied, cut, pasted;
+            CHECK(component->getState(&copied) == kResultOk);
+            press(u'x');
+            CHECK(component->getState(&cut) == kResultOk);
+            press(u'v');
+            CHECK(component->getState(&pasted) == kResultOk);
+            fprintf(stderr, "Edison %s clipboard state sizes: %zu / %zu / %zu\n",
+                appKit ? "AppKit" : "VST", copied.bytes.size(), cut.bytes.size(), pasted.bytes.size());
+            CHECK(cut.bytes.size() < copied.bytes.size() && pasted.bytes.size() == copied.bytes.size());
+            press(u'a');
+            press(u'c');
+            CHECK([[testClipboard dataForType:audioType] isEqualToData:audio]);
+        }
+        CHECK(view->onKeyDown(u'q', 0, kCommandKey) == kResultFalse);
+        CHECK([window makeFirstResponder:findVolumeKnob(window.contentView)]);
+        CHECK(view->onKeyDown(u'v', 0, kCommandKey) == kResultFalse);
+    }
     id nativeWindow = object_getIvar(editor, class_getInstanceVariable(NSClassFromString(@"D1NSView"), "owner"));
     Ivar handlerIvar = class_getInstanceVariable(NSClassFromString(@"MVObject"), "fEventHandler");
     CHECK(handlerIvar);
@@ -3158,6 +3278,10 @@ int main(int argc, char** argv) {
         }
         if (argc > 1 && strcmp(argv[1], "--edison-vst-poll") == 0) {
             verifyEdisonVSTPolling();
+            return 0;
+        }
+        if (argc > 1 && strcmp(argv[1], "--edison-clipboard") == 0) {
+            verifyEdisonVSTPolling(true);
             return 0;
         }
         if (argc > 1 && strcmp(argv[1], "--edison-input") == 0) {

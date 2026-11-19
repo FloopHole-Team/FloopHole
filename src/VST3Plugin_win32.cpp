@@ -162,6 +162,11 @@ private:
     HWND m_pluginHostHwnd = nullptr;
     HBRUSH m_bgBrush = nullptr;
     Win32EditorKeyboard m_editorKeyboard;
+    bool usesNativeEditorKeyboard() const {
+        if (!m_flInstance) return false;
+        const auto& name = m_flInstance->getPluginName();
+        return name == "Edison" || name == "Fruity NoteBook" || name == "Fruity NoteBook 2";
+    }
 
 };
 
@@ -495,19 +500,19 @@ LRESULT CALLBACK FLBridgePlugView::RootWndProc(HWND hwnd, UINT msg, WPARAM wPara
 }
 
 tresult PLUGIN_API FLBridgePlugView::onKeyDown(char16 key, int16 keyCode, int16 modifiers) {
-    if (!m_flInstance || m_flInstance->getPluginName() != "Edison") return kResultFalse;
+    if (!usesNativeEditorKeyboard()) return kResultFalse;
     return m_editorKeyboard.keyDown(m_pluginHostHwnd, key, keyCode, modifiers,
         m_flInstance->wantsEditorKeyboardInput()) ? kResultTrue : kResultFalse;
 }
 
 tresult PLUGIN_API FLBridgePlugView::onKeyUp(char16 key, int16 keyCode, int16 modifiers) {
-    if (!m_flInstance || m_flInstance->getPluginName() != "Edison") return kResultFalse;
+    if (!usesNativeEditorKeyboard()) return kResultFalse;
     return m_editorKeyboard.keyUp(m_pluginHostHwnd, key, keyCode, modifiers) ? kResultTrue : kResultFalse;
 }
 
 tresult PLUGIN_API FLBridgePlugView::onFocus(TBool state) {
     if (!state) m_editorKeyboard.reset();
-    if (m_flInstance && m_flInstance->getPluginName() == "Edison")
+    if (usesNativeEditorKeyboard())
         m_flInstance->setEditorFocus(state != 0);
     return kResultOk;
 }

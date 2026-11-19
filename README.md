@@ -17,6 +17,15 @@ To save the current plugin sound or effect settings, click the diskette next to
 Choose a filename to save an `.fst` and select it immediately in the preset
 dropdown. Presets saved in the default folder are found again on restart.
 
+Click the toolbar logo to open **About FloopHole**, with a larger logo, the
+compiled version and a link to the [GitHub repository](https://github.com/FloopHole-Team/FloopHole).
+The first release heading in [changelog.md](./changelog.md) supplies the version
+for the About window, VST3 metadata and macOS bundle when building.
+
+Cut, copy and paste use **Ctrl+X/C/V** on Windows and **Command+X/C/V** on macOS
+inside Fruity NoteBook, Fruity NoteBook 2 and Edison. Click the native writing
+surface or waveform first; shortcuts outside the editor remain with the host.
+
 ## License and legal notices
 
 FloopHole's original code is released under the [MIT License](./LICENSE).
@@ -105,6 +114,7 @@ With a local FL Studio installation, run the loaded-VST regressions:
 cmake --build build --target FloopHole test_vst3 --parallel
 build/test_vst3 --native-hover-help
 build/test_vst3 --edison-vst-poll
+build/test_vst3 --edison-clipboard
 build/test_vst3 --notebook-keyboard
 build/test_vst3 --notebook-appkit-keyboard
 build/test_vst3 --notebook-caret
@@ -113,8 +123,15 @@ build/test_vst3 --notebook-caret
 These check visible hover-help text and native Edison hover/leave state using
 the VST's real idle timer, plus Notebook typing/editing through host key
 callbacks and AppKit responders, saved-state restoration, and duplicate-delivery
-protection when a host invokes both keyboard APIs. They do not replace checking
+protection when a host invokes both keyboard APIs. Clipboard tests use an isolated
+pasteboard, checking actual Notebook text and Edison cut/paste audio state.
+The Notebook tests also check opening and reopening the About window.
+They do not replace checking
 the editor in the DAW.
+
+On Windows, the `test_windows_editor` target checks the About dialog, VCL
+shortcut forwarding and real Edit/RichEdit clipboard round-trips without
+duplicate pastes. It restores the previous clipboard contents after testing.
 
 Notebook typing/editing supports Cocoa responder events (used by Live) as well
 as VST key callbacks, only while a notebook writing surface has focus.

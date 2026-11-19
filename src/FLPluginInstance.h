@@ -120,6 +120,8 @@ public:
     void setEditorFocus(bool focused);
 #ifdef _WIN32
     bool wantsEditorKeyboardInput() const { return m_editorWantsKeyboard.load(std::memory_order_relaxed); }
+#elif defined(__APPLE__)
+    void* getEditorKeyboardWindow();
 #endif
 
     // Callbacks to VST3 Controller / UI

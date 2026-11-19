@@ -1,6 +1,7 @@
 #pragma once
 
 #include "NativePluginCatalog.h"
+#include "FloopHoleAssets.h"
 #include "pluginterfaces/base/ipluginbase.h"
 #include "pluginterfaces/vst/ivstaudioprocessor.h"
 #include <atomic>
@@ -34,7 +35,7 @@ public:
     }
     Steinberg::tresult PLUGIN_API getFactoryInfo(Steinberg::PFactoryInfo* info) override {
         if (!info) return Steinberg::kInvalidArgument;
-        *info = Steinberg::PFactoryInfo("FloopHole", "https://github.com/milestorm/FL-bridge-native",
+        *info = Steinberg::PFactoryInfo("FloopHole", kFloopHoleRepository,
             "", Steinberg::PFactoryInfo::kUnicode);
         return Steinberg::kResultOk;
     }
@@ -57,7 +58,7 @@ public:
         *info = Steinberg::PClassInfo2(id.toTUID(), Steinberg::PClassInfo::kManyInstances,
             kVstAudioEffectClass, entry.name.c_str(), Steinberg::Vst::kSimpleModeSupported,
             entry.isGenerator ? Steinberg::Vst::PlugType::kInstrumentSynth : Steinberg::Vst::PlugType::kFx,
-            "FloopHole", "1.0.0", kVstVersionString);
+            "FloopHole", kFloopHoleVersion, kVstVersionString);
         return Steinberg::kResultOk;
     }
     Steinberg::tresult PLUGIN_API getClassInfoUnicode(Steinberg::int32 index, Steinberg::PClassInfoW* info) override {

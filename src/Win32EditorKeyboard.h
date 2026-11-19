@@ -52,6 +52,26 @@ public:
         const UINT message = system ? WM_SYSKEYDOWN : WM_KEYDOWN;
         const LPARAM data = keyData(vk, keyCode, modifiers) |
             (m_targets[vk].window ? LPARAM(1) << 30 : 0);
+        const bool editShortcut = (modifiers & Steinberg::kCommandKey) &&
+            !(modifiers & Steinberg::kAlternateKey) &&
+            (vk == 'A' || vk == 'C' || vk == 'V' || vk == 'X' || vk == 'Z');
+        if (editShortcut && !(modifiers & Steinberg::kShiftKey) &&
+            (vk == 'C' || vk == 'V' || vk == 'X') &&
+            (SendMessageW(focused, WM_GETDLGCODE, vk, 0) & DLGC_HASSETSEL)) {
+            // Edit and RichEdit disagree about handling Ctrl keys in WM_KEYDOWN versus WM_CHAR.
+            SendMessageW(focused, vk == 'C' ? WM_COPY : vk == 'X' ? WM_CUT : WM_PASTE, 0, 0);
+            m_targets[vk] = {focused, false, system};
+            return true;
+        }
+        if (editShortcut) {
+            // Embedded VCL forms do not have their own application message loop.
+            for (HWND target = focused; target && target != container; target = GetParent(target)) {
+                if (SendMessageW(target, 0xb044 /* CM_ISSHORTCUT */, vk, data)) {
+                    m_targets[vk] = {target, false, system};
+                    return true;
+                }
+            }
+        }
         // VCL's reflected key message runs native shortcut processing and reports consumption.
         // Edison puts this handler on the wrapper above its focused audio editor.
         for (HWND target = focused; target && target != container; target = GetParent(target)) {

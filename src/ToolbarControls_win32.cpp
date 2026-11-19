@@ -1,5 +1,7 @@
 #include "ToolbarControls_win32.h"
 #include "Win32EditorDrawing.h"
+#include "FloopHoleAssets.h"
+#include <shellapi.h>
 #include <objidl.h>
 #include <windowsx.h>
 #include <gdiplus.h>
@@ -50,6 +52,7 @@ void text(Gdiplus::Graphics& graphics, const std::wstring& value, Gdiplus::RectF
 
 WindowsToolbar::WindowsToolbar(HWND parent, Actions actions) : m_parent(parent), m_actions(std::move(actions)) {}
 WindowsToolbar::~WindowsToolbar() {
+    if (m_about) EndDialog(m_about, IDCANCEL);
     closeMenu();
     for (HWND window : m_controls) if (window && IsWindow(window)) DestroyWindow(window);
     if (m_module) windowClasses().release();
@@ -70,12 +73,12 @@ bool WindowsToolbar::attach() {
     }
     m_module = windowClasses().acquire();
     if (!m_module) return false;
-    const wchar_t* names[] = {L"FloopHole", L"Preset", L"Previous preset", L"Next preset",
+    const wchar_t* names[] = {L"About FloopHole", L"Preset", L"Previous preset", L"Next preset",
         L"Load preset", L"Save preset as...", L"Ready"};
     for (size_t i = 0; i < m_controls.size(); ++i) {
         m_data[i] = {this, static_cast<int>(i), false, false};
         m_controls[i] = CreateWindowExW(0, L"FloopHoleToolbarControl", names[i],
-            WS_CHILD | WS_VISIBLE | (i >= 1 && i <= kBridgeSavePresetControl ? WS_TABSTOP : 0), 0, 0, 38, 38,
+            WS_CHILD | WS_VISIBLE | (i <= kBridgeSavePresetControl ? WS_TABSTOP : 0), 0, 0, 38, 38,
             m_parent, nullptr, m_module, &m_data[i]);
         if (!m_controls[i]) {
             fprintf(stderr, "FloopHole: toolbar control creation failed (%lu)\n", GetLastError());
@@ -114,11 +117,87 @@ void WindowsToolbar::setHint(const std::string& hint) {
 }
 
 void WindowsToolbar::activate(int control) {
-    if (control == 1) openMenu();
+    if (control == 0) showAbout();
+    else if (control == 1) openMenu();
     else if (control == 2 && m_actions.previous) m_actions.previous();
     else if (control == 3 && m_actions.next) m_actions.next();
     else if (control == kBridgeLoadPresetControl && m_actions.load) m_actions.load();
     else if (control == kBridgeSavePresetControl && m_actions.save) m_actions.save();
+}
+
+void WindowsToolbar::showAbout() {
+    closeMenu();
+    struct {
+        DLGTEMPLATE dialog;
+        WORD menu = 0, windowClass = 0, title = 0;
+    } layout{};
+    layout.dialog.style = WS_POPUP | WS_CAPTION | WS_SYSMENU | DS_MODALFRAME | DS_CENTER;
+    layout.dialog.cx = 270;
+    layout.dialog.cy = 180;
+    if (DialogBoxIndirectParamW(m_module, &layout.dialog, GetAncestor(m_parent, GA_ROOT),
+            aboutProc, reinterpret_cast<LPARAM>(this)) == -1)
+        fprintf(stderr, "FloopHole: could not open About window (%lu)\n", GetLastError());
+}
+
+INT_PTR CALLBACK WindowsToolbar::aboutProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
+    auto* toolbar = reinterpret_cast<WindowsToolbar*>(GetWindowLongPtrW(window, DWLP_USER));
+    if (message == WM_INITDIALOG) {
+        toolbar = reinterpret_cast<WindowsToolbar*>(lp);
+        SetWindowLongPtrW(window, DWLP_USER, lp);
+        toolbar->m_about = window;
+        SetWindowTextW(window, L"About FloopHole");
+        RECT bounds{0, 0, 420, 280};
+        AdjustWindowRectEx(&bounds, GetWindowLongW(window, GWL_STYLE), FALSE, GetWindowLongW(window, GWL_EXSTYLE));
+        SetWindowPos(window, nullptr, 0, 0, bounds.right - bounds.left, bounds.bottom - bounds.top,
+            SWP_NOMOVE | SWP_NOZORDER);
+        HWND link = CreateWindowExW(0, L"BUTTON", wide(kFloopHoleRepository).c_str(),
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_FLAT, 10, 180, 400, 30,
+            window, reinterpret_cast<HMENU>(100), toolbar->m_module, nullptr);
+        HWND close = CreateWindowExW(0, L"BUTTON", L"Close",
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON, 170, 232, 80, 28,
+            window, reinterpret_cast<HMENU>(IDOK), toolbar->m_module, nullptr);
+        if (!link || !close) {
+            fprintf(stderr, "FloopHole: could not create About controls (%lu)\n", GetLastError());
+            EndDialog(window, IDCANCEL);
+        }
+        return TRUE;
+    }
+    if (!toolbar) return FALSE;
+    if (message == WM_COMMAND) {
+        if (LOWORD(wp) == IDOK || LOWORD(wp) == IDCANCEL) EndDialog(window, LOWORD(wp));
+        else if (LOWORD(wp) == 100) {
+            if (reinterpret_cast<INT_PTR>(ShellExecuteW(window, L"open", wide(kFloopHoleRepository).c_str(),
+                    nullptr, nullptr, SW_SHOWNORMAL)) <= 32)
+                MessageBoxW(window, L"Could not open the repository in your browser.", L"FloopHole", MB_ICONERROR);
+        }
+        return TRUE;
+    }
+    if (message == WM_PAINT) {
+        PAINTSTRUCT paint{};
+        HDC dc = BeginPaint(window, &paint);
+        {
+            Gdiplus::Graphics graphics(dc);
+            graphics.Clear(color(ToolbarTheme::background));
+            auto logo = renderLogo(86);
+            if (!logo.pixels.empty()) {
+                Gdiplus::Bitmap image(86, 86, logo.stride, PixelFormat32bppPARGB, logo.pixels.data());
+                graphics.DrawImage(&image, 167, 20);
+            }
+            graphics.SetTextRenderingHint(Gdiplus::TextRenderingHintAntiAliasGridFit);
+            Gdiplus::StringFormat centered = editorStringFormat();
+            centered.SetAlignment(Gdiplus::StringAlignmentCenter);
+            Gdiplus::Font heading(L"Segoe UI", 24, Gdiplus::FontStyleBold, Gdiplus::UnitPixel);
+            Gdiplus::Font body(L"Segoe UI", 13, Gdiplus::FontStyleRegular, Gdiplus::UnitPixel);
+            Gdiplus::SolidBrush foreground(color(ToolbarTheme::text));
+            graphics.DrawString(L"FloopHole", -1, &heading, Gdiplus::RectF(10, 118, 400, 32), &centered, &foreground);
+            graphics.DrawString(wide(std::string("Version ") + kFloopHoleVersion).c_str(), -1, &body,
+                Gdiplus::RectF(10, 155, 400, 22), &centered, &foreground);
+        }
+        EndPaint(window, &paint);
+        return TRUE;
+    }
+    if (message == WM_DESTROY) toolbar->m_about = nullptr;
+    return FALSE;
 }
 
 void WindowsToolbar::paintControl(HWND window, int index, bool hover, bool pressed) {
@@ -200,7 +279,7 @@ LRESULT CALLBACK WindowsToolbar::controlProc(HWND window, UINT message, WPARAM w
         case WM_PAINT: data->owner->paintControl(window, data->index, data->hover, data->pressed); return 0;
         case WM_GETDLGCODE: return DLGC_WANTARROWS;
         case WM_LBUTTONDOWN:
-            if (data->index < 1 || data->index > kBridgeSavePresetControl) return 0;
+            if (data->index < 0 || data->index > kBridgeSavePresetControl) return 0;
             SetFocus(window); SetCapture(window); data->pressed = true; InvalidateRect(window, nullptr, FALSE); return 0;
         case WM_LBUTTONUP: {
             const bool pressed = data->pressed;

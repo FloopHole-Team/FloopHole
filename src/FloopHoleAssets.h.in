@@ -1,5 +1,7 @@
 #pragma once
 
 namespace flbr {
+inline constexpr char kFloopHoleVersion[] = "@PROJECT_VERSION@";
+inline constexpr char kFloopHoleRepository[] = "https://github.com/FloopHole-Team/FloopHole";
 inline constexpr char kFloopHoleLogo[] = R"FH_SVG(@FLOOPHOLE_LOGO@)FH_SVG";
 }

@@ -809,7 +809,7 @@ bool FLPluginInstance::attachEditorToNSView(void* parentHwnd, int& outWidth, int
     // On Windows, FPD_ShowEditor takes the parent HWND directly and sets m_plug->EditorHandle (+0x18)
     m_fnDispatcher(m_plug, FPD_ShowEditor, 0, (intptr_t)hParent);
     m_editorOpen = true;
-    if (m_pluginName == "Edison") {
+    if (m_pluginName == "Edison" || m_pluginName == "Fruity NoteBook" || m_pluginName == "Fruity NoteBook 2") {
         m_editorWantsKeyboard.store(true, std::memory_order_relaxed);
         m_fnDispatcher(m_plug, FPD_StealKBFocus, 0, 1);
     }

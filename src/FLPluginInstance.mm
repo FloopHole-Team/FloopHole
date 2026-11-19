@@ -1557,12 +1557,42 @@ bool FLPluginInstance::resizeEditor(int& width, int& height) {
     return false;
 }
 
+void* FLPluginInstance::getEditorKeyboardWindow() {
+    std::lock_guard<std::recursive_mutex> lock(m_mutex);
+    if (!m_plug || !m_editorOpen || m_pluginName != "Edison") return nullptr;
+    void* form = *reinterpret_cast<void**>(static_cast<uint8_t*>(m_plug) + 0xc8);
+    Class objectClass = NSClassFromString(@"MVObject");
+    Ivar dataIvar = class_getInstanceVariable(objectClass, "fEventHandlerData");
+    if (form && dataIvar) {
+        for (NSWindow* backing in NSApp.windows) {
+            id wrapper = backing.delegate;
+            if (![wrapper isKindOfClass:objectClass] || ![wrapper respondsToSelector:@selector(sendKeyEvent:)])
+                continue;
+            // MacVCL's event adapter stores a Pascal method pair (code, receiver).
+            // Edison also has a generic host form; only the real synth form handles its shortcuts.
+            struct EventAdapter { const uintptr_t* vmt; void* code; void* receiver; };
+            const EventAdapter* adapter = nullptr;
+            memcpy(&adapter, static_cast<const uint8_t*>((__bridge const void*)wrapper) + ivar_getOffset(dataIvar),
+                sizeof(adapter));
+            if (!adapter || !adapter->vmt || adapter->vmt[0] != sizeof(EventAdapter)) continue;
+            const auto* name = reinterpret_cast<const uint8_t*>(adapter->vmt[3]);
+            if (name && name[0] == 13 && memcmp(name + 1, "TEventHandler", 13) == 0 &&
+                adapter->receiver == form)
+                return (__bridge void*)wrapper;
+        }
+    }
+    fprintf(stderr, "FloopHole: Edison native keyboard window is unavailable for this editor version\n");
+    return nullptr;
+}
+
 void FLPluginInstance::setEditorFocus(bool focused) {
     std::lock_guard<std::recursive_mutex> lock(m_mutex);
     if (!m_plug || !m_editorOpen || !m_parentNSView) return;
     NSView* editor = nativeEditorView((__bridge NSView*)m_parentNSView);
+    id keyboardWindow = m_pluginName == "Edison" ? (__bridge id)getEditorKeyboardWindow() : nil;
+    if (m_pluginName == "Edison" && !keyboardWindow) return;
     for (NSWindow* backing in NSApp.windows) {
-        if (hostedEditorForWindow(backing) != editor) continue;
+        if (keyboardWindow ? backing.delegate != keyboardWindow : hostedEditorForWindow(backing) != editor) continue;
         id<NSWindowDelegate> delegate = backing.delegate;
         const SEL selector = focused ? @selector(windowDidBecomeKey:) : @selector(windowDidResignKey:);
         if (![delegate respondsToSelector:selector]) {

@@ -322,6 +322,8 @@ private:
     std::set<unsigned short> m_notebookKeys;
     bool m_notebookHasFocus = true;
     bool m_notebookNativeFocused = false;
+    id m_edisonKeyboardMonitor = nil;
+    bool m_edisonKeyboardFocused = false;
 };
 
 // ============================================================================
@@ -679,19 +681,29 @@ bool FLBridgePlugView::handleNotebookEvent(NSEvent* event) {
     if (NSNumber* result = [results objectForKey:m_target]) {
         return result.boolValue;
     }
-    if (!m_notebookHasFocus || !m_notebookFocusViews || !m_pluginHostView.window) {
+    if (!m_notebookHasFocus || !m_pluginHostView.window) {
         return false;
     }
-    NSResponder* responder = m_pluginHostView.window.firstResponder;
-    if (![responder isKindOfClass:NSView.class] || ![(NSView*)responder isDescendantOf:m_pluginHostView]) {
-        return false;
-    }
-    if (![m_notebookFocusViews containsObject:(NSView*)responder]) {
-        return false;
+    const bool edison = m_flInstance && m_flInstance->getPluginName() == "Edison";
+    if (edison) {
+        if (!m_edisonKeyboardFocused || event.window != m_pluginHostView.window) return false;
+        NSResponder* responder = m_pluginHostView.window.firstResponder;
+        if ([responder isKindOfClass:NSView.class] && [(NSView*)responder isDescendantOf:m_toolbarView])
+            return false;
+    } else {
+        NSResponder* responder = m_pluginHostView.window.firstResponder;
+        if (!m_notebookFocusViews || ![responder isKindOfClass:NSView.class] ||
+            ![m_notebookFocusViews containsObject:(NSView*)responder]) return false;
     }
     const bool down = event.type == NSEventTypeKeyDown;
     const bool up = event.type == NSEventTypeKeyUp;
     if (!down && !up && event.type != NSEventTypeFlagsChanged) return false;
+    if (edison) {
+        const auto text = event.charactersIgnoringModifiers;
+        const bool shortcut = down && (event.modifierFlags & NSEventModifierFlagCommand) &&
+            notebookTextCommand(text.length ? [text characterAtIndex:0] : 0, false);
+        if (!shortcut && !(up && m_notebookKeys.count(event.keyCode))) return false;
+    }
     if ((down || up) && (event.modifierFlags & NSEventModifierFlagCommand)) {
         const unsigned short code = event.keyCode;
         const bool navigation = code == kVK_Delete || code == kVK_ForwardDelete ||
@@ -712,7 +724,7 @@ bool FLBridgePlugView::handleNotebookEvent(NSEvent* event) {
     if (up && !pairedUp) {
         return false;
     }
-    const BOOL nativeHandled = [m_notebookWindowWrapper sendKeyEvent:event];
+    const bool nativeHandled = [m_notebookWindowWrapper sendKeyEvent:event];
     const bool handled = nativeHandled || pairedUp; // Do not leak releases for consumed key-downs to the DAW.
     if (down && handled) m_notebookKeys.insert(event.keyCode);
     [results setObject:@(handled) forKey:m_target];
@@ -720,7 +732,7 @@ bool FLBridgePlugView::handleNotebookEvent(NSEvent* event) {
 }
 
 bool FLBridgePlugView::sendNotebookKey(bool down, char16 key, int16 keyCode, int16 modifiers) {
-    if (!m_notebookFocusViews || !m_pluginHostView.window) return false;
+    if ((!m_notebookFocusViews && !m_edisonKeyboardMonitor) || !m_pluginHostView.window) return false;
     NSEvent* event = notebookKeyEvent(m_pluginHostView.window, down, key, keyCode, modifiers);
     if (!event) {
         return false;
@@ -743,11 +755,12 @@ tresult PLUGIN_API FLBridgePlugView::onKeyUp(char16 key, int16 keyCode, int16 mo
 }
 
 void FLBridgePlugView::updateNotebookNativeFocus(bool refresh) {
-    if (!m_notebookFocusViews || !m_flInstance) return;
+    if ((!m_notebookFocusViews && !m_edisonKeyboardMonitor) || !m_flInstance) return;
     NSWindow* window = m_pluginHostView.window;
     NSResponder* responder = window.firstResponder;
     const bool focused = m_notebookHasFocus && window.keyWindow &&
-        [responder isKindOfClass:NSView.class] && [m_notebookFocusViews containsObject:(NSView*)responder];
+        (m_edisonKeyboardMonitor ? m_edisonKeyboardFocused :
+            [responder isKindOfClass:NSView.class] && [m_notebookFocusViews containsObject:(NSView*)responder]);
     if (focused == m_notebookNativeFocused && !(refresh && focused)) return;
     m_notebookNativeFocused = focused;
     m_flInstance->setEditorFocus(focused);
@@ -853,17 +866,39 @@ tresult PLUGIN_API FLBridgePlugView::attached(void* parent, FIDString type) {
             int pw = 900, ph = 600;
             if (m_flInstance->attachEditorToNSView((__bridge void*)m_pluginHostView, pw, ph)) {
                 const std::string& name = m_flInstance->getPluginName();
-                if (name == "Fruity NoteBook" || name == "Fruity NoteBook 2") {
+                if (name == "Fruity NoteBook" || name == "Fruity NoteBook 2" || name == "Edison") {
                     NSView* editor = m_pluginHostView.subviews.firstObject;
                     Ivar owner = class_getInstanceVariable(NSClassFromString(@"D1NSView"), "owner");
                     if (editor && owner && [editor isKindOfClass:NSClassFromString(@"D1NSView")]) {
                         m_notebookWindowWrapper = object_getIvar(editor, owner);
-                        m_notebookFocusViews = [NSHashTable weakObjectsHashTable];
                         NSHashTable<FloopHoleToolbarTarget*>* reference = [NSHashTable weakObjectsHashTable];
                         [reference addObject:m_target];
-                        installNotebookFocus(editor, m_notebookFocusViews, reference);
+                        if (name == "Edison") {
+                            m_notebookWindowWrapper = (__bridge id)m_flInstance->getEditorKeyboardWindow();
+                            if (!m_notebookWindowWrapper)
+                                setHintText("Edison clipboard shortcuts are unavailable for this native editor version. See the host log.");
+                            // Keep Edison's existing mouse/drop subclasses intact. Library-mode
+                            // MacVCL does not participate in the host's Edit-menu shortcut routing.
+                            m_edisonKeyboardMonitor = [NSEvent addLocalMonitorForEventsMatchingMask:
+                                NSEventMaskKeyDown | NSEventMaskKeyUp | NSEventMaskLeftMouseDown |
+                                NSEventMaskRightMouseDown | NSEventMaskOtherMouseDown
+                                handler:^NSEvent*(NSEvent* event) {
+                                    FLBridgePlugView* view = reference.anyObject.plugView;
+                                    if (!view) return event;
+                                    if (event.type == NSEventTypeKeyDown || event.type == NSEventTypeKeyUp)
+                                        return view->handleNotebookEvent(event) ? nil : event;
+                                    view->m_edisonKeyboardFocused = event.window == view->m_pluginHostView.window &&
+                                        NSPointInRect([view->m_pluginHostView convertPoint:event.locationInWindow fromView:nil],
+                                            view->m_pluginHostView.bounds);
+                                    view->updateNotebookNativeFocus(true);
+                                    return event;
+                                }];
+                        } else {
+                            m_notebookFocusViews = [NSHashTable weakObjectsHashTable];
+                            installNotebookFocus(editor, m_notebookFocusViews, reference);
+                        }
                     } else {
-                        fprintf(stderr, "FloopHole: native notebook keyboard routing is unavailable\n");
+                        fprintf(stderr, "FloopHole: native editor keyboard routing is unavailable for %s\n", name.c_str());
                     }
                 }
                 layoutSubviews(pw, ph);
@@ -887,6 +922,9 @@ tresult PLUGIN_API FLBridgePlugView::attached(void* parent, FIDString type) {
 }
 
 tresult PLUGIN_API FLBridgePlugView::removed() {
+    if (m_edisonKeyboardMonitor) [NSEvent removeMonitor:m_edisonKeyboardMonitor];
+    m_edisonKeyboardMonitor = nil;
+    m_edisonKeyboardFocused = false;
     m_notebookKeys.clear();
     if (m_notebookNativeFocused && m_flInstance) m_flInstance->setEditorFocus(false);
     m_notebookNativeFocused = false;

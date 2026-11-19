@@ -44,6 +44,8 @@ private:
     void paintControl(HWND, int, bool, bool);
     void paintMenu();
     void activate(int);
+    void showAbout();
+    static INT_PTR CALLBACK aboutProc(HWND, UINT, WPARAM, LPARAM);
     void openMenu();
     void chooseRow(int);
     void handleChar(wchar_t ch);
@@ -51,6 +53,7 @@ private:
     void scrollToRow(int row);
     HWND m_parent = nullptr;
     HWND m_menu = nullptr;
+    HWND m_about = nullptr;
     HINSTANCE m_module = nullptr;
     Actions m_actions;
     std::array<HWND, kBridgeMasterVolumeControl> m_controls{};

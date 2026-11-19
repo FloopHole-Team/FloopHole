@@ -3,6 +3,7 @@
 #include "BridgeEditorLayout.h"
 #include "Win32AudioFileDrag.h"
 #include "Win32EditorKeyboard.h"
+#include <ole2.h>
 #include <algorithm>
 #include <array>
 #include <cstdlib>
@@ -52,6 +53,57 @@ static void paintToolbar(WindowsToolbar& toolbar) {
     CHECK(graphics.DrawString(L"VOL", -1, &font, Gdiplus::RectF(0, 29, 40, 9), &format, &foreground) == Gdiplus::Ok);
 }
 
+static void testTextClipboard() {
+    HMODULE richEdit = LoadLibraryW(L"Msftedit.dll");
+    CHECK(richEdit);
+    HWND parent = CreateWindowExW(0, L"STATIC", L"", WS_POPUP, 0, 0, 320, 100,
+        nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
+    CHECK(parent);
+    std::array<HWND, 2> editors{};
+    const wchar_t* types[] = {L"EDIT", L"RICHEDIT50W"};
+    for (size_t i = 0; i < editors.size(); ++i) {
+        editors[i] = CreateWindowExW(0, types[i], L"FloopHole clipboard", WS_CHILD | ES_MULTILINE,
+            0, 0, 320, 100, parent, nullptr, GetModuleHandleW(nullptr), nullptr);
+        CHECK(editors[i]);
+    }
+    std::vector<std::pair<UINT, HANDLE>> original;
+    CHECK(OpenClipboard(parent));
+    for (UINT format = EnumClipboardFormats(0); format; format = EnumClipboardFormats(format)) {
+        HANDLE data = OleDuplicateData(GetClipboardData(format), format, GMEM_MOVEABLE);
+        CHECK(data);
+        original.emplace_back(format, data);
+    }
+    CHECK(CloseClipboard());
+    bool valid = true;
+    for (HWND editor : editors) {
+        SetFocus(editor);
+        valid &= GetFocus() == editor;
+        SendMessageW(editor, EM_SETSEL, 0, GetWindowTextLengthW(editor));
+        Win32EditorKeyboard keyboard;
+        const auto press = [&](Steinberg::char16 key) {
+            const bool down = keyboard.keyDown(parent, key, 0, Steinberg::kCommandKey, true);
+            const bool up = keyboard.keyUp(parent, key, 0, 0);
+            return down && up;
+        };
+        valid &= press(u'c') && IsClipboardFormatAvailable(CF_UNICODETEXT);
+        valid &= press(u'x') && GetWindowTextLengthW(editor) == 0;
+        valid &= press(u'v');
+        wchar_t text[64]{};
+        GetWindowTextW(editor, text, 64);
+        valid &= std::wstring(text) == L"FloopHole clipboard";
+        valid &= press(u'v');
+        GetWindowTextW(editor, text, 64);
+        valid &= std::wstring(text) == L"FloopHole clipboardFloopHole clipboard";
+    }
+    CHECK(OpenClipboard(parent));
+    CHECK(EmptyClipboard());
+    for (const auto& entry : original) CHECK(SetClipboardData(entry.first, entry.second));
+    CHECK(CloseClipboard());
+    CHECK(DestroyWindow(parent));
+    CHECK(FreeLibrary(richEdit));
+    CHECK(valid);
+}
+
 static LRESULT CALLBACK testProcedure(HWND window, UINT message, WPARAM wp, LPARAM lp) {
     return DefWindowProcW(window, message, wp, lp);
 }
@@ -78,6 +130,8 @@ static void testEditorKeyboard() {
     using namespace Steinberg;
     struct Input {
         bool consume = false;
+        bool shortcut = false;
+        int shortcuts = 0;
         int downs = 0, ups = 0;
         int rawDowns = 0, rawUps = 0, characters = 0;
         LPARAM data = 0;
@@ -91,6 +145,12 @@ static void testEditorKeyboard() {
                 if (message == WM_KEYUP) ++input->rawUps;
                 if (message == WM_CHAR) ++input->characters;
                 return 0;
+            }
+            if (input && message == 0xb044) {
+                if (!input->shortcut) return 0;
+                CHECK(GetKeyState(VK_CONTROL) & 0x8000);
+                ++input->shortcuts;
+                return 1;
             }
             if (input && (message == 0xbc00 + WM_KEYDOWN || message == 0xbc00 + WM_KEYUP)) {
                 CHECK(GetKeyboardState(input->modifiers.data()));
@@ -164,6 +224,13 @@ static void testEditorKeyboard() {
     CHECK(childInput.rawDowns == 3 && childInput.characters == 1);
     CHECK(keyboard.keyUp(container, u'q', 0, 0));
     CHECK(wrapperInput.rawDowns == 0 && wrapperInput.rawUps == 0);
+    wrapperInput.shortcut = true;
+    for (char16 key : {u'c', u'x', u'v'}) {
+        CHECK(keyboard.keyDown(container, key, 0, kCommandKey, true));
+        CHECK(keyboard.keyUp(container, key, 0, 0));
+    }
+    CHECK(wrapperInput.shortcuts == 3 && childInput.rawDowns == 3 && childInput.characters == 1);
+    wrapperInput.shortcut = false;
     const int childUps = childInput.ups;
     childInput.consume = true;
     const int wrapperDowns = wrapperInput.downs;
@@ -375,6 +442,19 @@ static void testPresetMenuInteractions() {
 
     auto toolbar = std::make_unique<WindowsToolbar>(parent, actions);
     CHECK(toolbar->attach());
+    const UINT_PTR timer = SetTimer(nullptr, 0, 50, +[](HWND, UINT, UINT_PTR id, DWORD) {
+        HWND about = FindWindowW(L"#32770", L"About FloopHole");
+        CHECK(about && IsWindowVisible(about));
+        wchar_t link[128]{};
+        GetWindowTextW(GetDlgItem(about, 100), link, 128);
+        CHECK(std::wstring(link) == L"https://github.com/FloopHole-Team/FloopHole");
+        CHECK(GetDlgItem(about, IDOK));
+        CHECK(KillTimer(nullptr, id));
+        SendMessageW(about, WM_COMMAND, IDOK, 0);
+    });
+    CHECK(timer);
+    SendMessageW(toolbar->controls()[0], WM_KEYDOWN, VK_RETURN, 0);
+    CHECK(!FindWindowW(L"#32770", L"About FloopHole"));
     SendMessageW(toolbar->controls()[kBridgeSavePresetControl], WM_KEYDOWN, VK_RETURN, 0);
     CHECK(saved == 1);
 
@@ -476,6 +556,7 @@ static void testPresetMenuInteractions() {
 int main() {
     testClassLifetime();
     testEditorKeyboard();
+    testTextClipboard();
     testAudioFileDrag();
     testGripColors();
     testPresetMenuItems();

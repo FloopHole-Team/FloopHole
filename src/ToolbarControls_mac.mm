@@ -1,5 +1,6 @@
 #import "ToolbarControls_mac.h"
 #include "LogoRenderer.h"
+#include "FloopHoleAssets.h"
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -19,15 +20,88 @@ static void drawSurface(NSRect bounds, BOOL hover, BOOL pressed) {
 
 @implementation FloopHoleLogoView {
     LogoRaster _raster;
+    NSWindow* _aboutWindow;
 }
 - (instancetype)initWithFrame:(NSRect)frame {
     if ((self = [super initWithFrame:frame])) {
-        self.toolTip = @"FloopHole";
+        self.toolTip = @"About FloopHole";
+        self.target = self;
+        self.action = @selector(showAbout:);
         self.accessibilityElement = YES;
-        self.accessibilityRole = NSAccessibilityImageRole;
-        self.accessibilityLabel = @"FloopHole";
+        self.accessibilityRole = NSAccessibilityButtonRole;
+        self.accessibilityLabel = @"About FloopHole";
     }
     return self;
+}
+- (BOOL)acceptsFirstResponder { return self.enabled; }
+- (void)mouseDown:(NSEvent*)event {
+    if (self.enabled) [self.window makeFirstResponder:self];
+}
+- (void)mouseUp:(NSEvent*)event {
+    if (self.enabled && NSPointInRect([self convertPoint:event.locationInWindow fromView:nil], self.bounds))
+        [self sendAction:self.action to:self.target];
+}
+- (void)keyDown:(NSEvent*)event {
+    if ([event.characters isEqualToString:@" "] || [event.characters isEqualToString:@"\r"])
+        [self sendAction:self.action to:self.target];
+    else [super keyDown:event];
+}
+- (BOOL)accessibilityPerformPress {
+    return self.enabled && [self sendAction:self.action to:self.target];
+}
+- (void)viewWillMoveToWindow:(NSWindow*)window {
+    if (!window) [_aboutWindow close];
+    [super viewWillMoveToWindow:window];
+}
+- (void)dealloc { [_aboutWindow close]; }
+- (void)showAbout:(id)sender {
+    if (!_aboutWindow) {
+        _aboutWindow = [[NSWindow alloc] initWithContentRect:NSMakeRect(0, 0, 420, 270)
+            styleMask:NSWindowStyleMaskTitled | NSWindowStyleMaskClosable
+            backing:NSBackingStoreBuffered defer:NO];
+        _aboutWindow.title = @"About FloopHole";
+        _aboutWindow.releasedWhenClosed = NO;
+        _aboutWindow.backgroundColor = themeColor(ToolbarTheme::background);
+        FloopHoleLogoView* logo = [[FloopHoleLogoView alloc] initWithFrame:NSMakeRect(167, 162, 86, 86)];
+        logo.enabled = NO;
+        logo.toolTip = nil;
+        logo.accessibilityRole = NSAccessibilityImageRole;
+        logo.accessibilityLabel = @"FloopHole";
+        [_aboutWindow.contentView addSubview:logo];
+        const auto label = [&](NSString* title, CGFloat y, CGFloat fontSize) {
+            NSTextField* field = [NSTextField labelWithString:title];
+            field.frame = NSMakeRect(16, y, 388, 30);
+            field.alignment = NSTextAlignmentCenter;
+            field.font = [NSFont systemFontOfSize:fontSize weight:fontSize > 20 ? NSFontWeightBold : NSFontWeightRegular];
+            field.textColor = themeColor(ToolbarTheme::text);
+            [_aboutWindow.contentView addSubview:field];
+        };
+        label(@"FloopHole", 115, 24);
+        label([@"Version " stringByAppendingString:[NSString stringWithUTF8String:kFloopHoleVersion]], 82, 13);
+        NSButton* link = [NSButton buttonWithTitle:[NSString stringWithUTF8String:kFloopHoleRepository]
+            target:self action:@selector(openRepository:)];
+        link.frame = NSMakeRect(12, 38, 396, 28);
+        link.bordered = NO;
+        link.attributedTitle = [[NSAttributedString alloc] initWithString:link.title
+            attributes:@{NSForegroundColorAttributeName:NSColor.linkColor,
+                NSUnderlineStyleAttributeName:@(NSUnderlineStyleSingle),
+                NSFontAttributeName:[NSFont systemFontOfSize:12]}];
+        [_aboutWindow.contentView addSubview:link];
+    }
+    if (!_aboutWindow.visible) {
+        [_aboutWindow center];
+        if (self.window) [self.window addChildWindow:_aboutWindow ordered:NSWindowAbove];
+    }
+    [_aboutWindow makeKeyAndOrderFront:nil];
+}
+- (void)openRepository:(id)sender {
+    if (![NSWorkspace.sharedWorkspace openURL:[NSURL URLWithString:[NSString stringWithUTF8String:kFloopHoleRepository]]]) {
+        fprintf(stderr, "FloopHole: could not open repository URL\n");
+        NSAlert* alert = [[NSAlert alloc] init];
+        alert.messageText = @"Could not open the repository in your browser.";
+        alert.informativeText = [NSString stringWithUTF8String:kFloopHoleRepository];
+        [alert runModal];
+    }
 }
 - (void)viewDidChangeBackingProperties { [self setNeedsDisplay:YES]; }
 - (void)drawRect:(NSRect)dirty {

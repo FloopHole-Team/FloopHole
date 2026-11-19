@@ -1,13 +1,22 @@
 cmake_minimum_required(VERSION 3.20)
 
+file(STRINGS "${CMAKE_CURRENT_SOURCE_DIR}/changelog.md" FLOOPHOLE_VERSION_HEADING
+    REGEX "^## \\[[0-9]+\\.[0-9]+\\.[0-9]+\\]" LIMIT_COUNT 1)
+if(NOT FLOOPHOLE_VERSION_HEADING)
+    message(FATAL_ERROR "changelog.md must contain a version heading: ## [major.minor.patch]")
+endif()
+string(REGEX REPLACE "^## \\[([0-9]+\\.[0-9]+\\.[0-9]+)\\].*$" "\\1"
+    FLOOPHOLE_VERSION "${FLOOPHOLE_VERSION_HEADING}")
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/changelog.md")
+
 if(APPLE)
-    project(FloopHole VERSION 1.0.0 LANGUAGES C CXX OBJCXX)
+    project(FloopHole VERSION ${FLOOPHOLE_VERSION} LANGUAGES C CXX OBJCXX)
     set(CMAKE_OBJCXX_STANDARD 17)
     set(CMAKE_OBJCXX_STANDARD_REQUIRED ON)
     set(CMAKE_OSX_ARCHITECTURES "arm64;x86_64" CACHE STRING "Build architectures for macOS")
     set(CMAKE_OSX_DEPLOYMENT_TARGET "12.0" CACHE STRING "Minimum macOS deployment version")
 else()
-    project(FloopHole VERSION 1.0.0 LANGUAGES C CXX)
+    project(FloopHole VERSION ${FLOOPHOLE_VERSION} LANGUAGES C CXX)
 endif()
 
 set(CMAKE_CXX_STANDARD 17)
@@ -148,6 +157,7 @@ if(APPLE)
     target_include_directories(test_vst3 PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/src
         ${VST3_PLUGINTERFACES_DIR}
+        ${CMAKE_CURRENT_BINARY_DIR}/generated
     )
 
     target_compile_definitions(test_vst3 PRIVATE
@@ -315,7 +325,7 @@ if(BUILD_TESTING AND (APPLE OR WIN32))
         )
         target_include_directories(test_windows_editor PRIVATE
             src "${CMAKE_CURRENT_BINARY_DIR}/generated" "${VST3_PLUGINTERFACES_DIR}")
-        target_link_libraries(test_windows_editor PRIVATE user32 gdi32 gdiplus lunasvg::lunasvg)
+        target_link_libraries(test_windows_editor PRIVATE user32 gdi32 gdiplus shell32 ole32 lunasvg::lunasvg)
         if(MINGW)
             target_link_options(test_windows_editor PRIVATE -static -static-libgcc -static-libstdc++)
         endif()

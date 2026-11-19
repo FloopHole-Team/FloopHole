@@ -11,7 +11,8 @@ inline NSColor* themeColor(uint32_t rgb) {
 }
 }
 
-@interface FloopHoleLogoView : NSView
+@interface FloopHoleLogoView : NSControl
+- (void)showAbout:(id)sender;
 @end
 
 @interface FloopHoleButton : NSButton
