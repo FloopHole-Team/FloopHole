@@ -428,6 +428,53 @@ static void testPresetMenuItems() {
     CHECK(items[5].text == "Init" && items[5].preset == 3);
 }
 
+static void checkAboutControl(HWND about, int id) {
+    HWND control = GetDlgItem(about, id);
+    CHECK(control);
+    RECT rect{};
+    CHECK(GetClientRect(control, &rect));
+    HDC dc = CreateCompatibleDC(nullptr);
+    CHECK(dc);
+    BITMAPINFO info{};
+    info.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    info.bmiHeader.biWidth = rect.right;
+    info.bmiHeader.biHeight = -rect.bottom;
+    info.bmiHeader.biPlanes = 1;
+    info.bmiHeader.biBitCount = 32;
+    void* memory = nullptr;
+    HBITMAP bitmap = CreateDIBSection(dc, &info, DIB_RGB_COLORS, &memory, nullptr, 0);
+    CHECK(bitmap && memory);
+    HGDIOBJ previous = SelectObject(dc, bitmap);
+    DRAWITEMSTRUCT item{};
+    item.CtlType = ODT_BUTTON;
+    item.CtlID = id;
+    item.itemAction = ODA_DRAWENTIRE;
+    item.hwndItem = control;
+    item.hDC = dc;
+    item.rcItem = rect;
+    SendMessageW(about, WM_DRAWITEM, id, reinterpret_cast<LPARAM>(&item));
+    GdiFlush();
+    const auto* pixels = static_cast<const uint32_t*>(memory);
+    CHECK((pixels[0] & 0xFFFFFF) == ToolbarTheme::background);
+    int blue = 0, background = 0;
+    for (int i = 0; i < rect.right * rect.bottom; ++i) {
+        const auto rgb = pixels[i] & 0xFFFFFF;
+        CHECK(rgb != 0xFFFFFF);
+        background += rgb == ToolbarTheme::background;
+        blue += (rgb & 255) > ((rgb >> 16) & 255) + 60;
+    }
+    if (id == 100) {
+        CHECK(background > rect.right * rect.bottom * 3 / 4);
+        CHECK(blue > 100);
+        SendMessageW(about, WM_SETCURSOR, reinterpret_cast<WPARAM>(control),
+            MAKELPARAM(HTCLIENT, WM_MOUSEMOVE));
+        CHECK(GetCursor() == LoadCursor(nullptr, IDC_HAND));
+    }
+    SelectObject(dc, previous);
+    CHECK(DeleteObject(bitmap));
+    CHECK(DeleteDC(dc));
+}
+
 static void testPresetMenuInteractions() {
     GraphicsSession session;
     HWND parent = CreateWindowExW(0, L"STATIC", L"FloopHole interaction test", WS_POPUP,
@@ -443,14 +490,21 @@ static void testPresetMenuInteractions() {
     auto toolbar = std::make_unique<WindowsToolbar>(parent, actions);
     CHECK(toolbar->attach());
     const UINT_PTR timer = SetTimer(nullptr, 0, 50, +[](HWND, UINT, UINT_PTR id, DWORD) {
+        static int attempts = 0;
+        CHECK(++attempts <= 100);
         HWND about = FindWindowW(L"#32770", L"About FloopHole");
-        CHECK(about && IsWindowVisible(about));
+        if (!about || !IsWindowVisible(about)) return;
+        attempts = 0;
         wchar_t link[128]{};
         GetWindowTextW(GetDlgItem(about, 100), link, 128);
         CHECK(std::wstring(link) == L"https://github.com/FloopHole-Team/FloopHole");
-        CHECK(GetDlgItem(about, IDOK));
+        checkAboutControl(about, 100);
+        checkAboutControl(about, IDOK);
+        CHECK(GetFocus() == GetDlgItem(about, 100));
+        SendMessageW(about, WM_NEXTDLGCTL, 0, FALSE);
+        CHECK(GetFocus() == GetDlgItem(about, IDOK));
         CHECK(KillTimer(nullptr, id));
-        SendMessageW(about, WM_COMMAND, IDOK, 0);
+        SendMessageW(GetDlgItem(about, IDOK), BM_CLICK, 0, 0);
     });
     CHECK(timer);
     SendMessageW(toolbar->controls()[0], WM_KEYDOWN, VK_RETURN, 0);
@@ -553,7 +607,14 @@ static void testPresetMenuInteractions() {
     CHECK(DestroyWindow(parent));
 }
 
-int main() {
+int main(int argc, char** argv) {
+    if (argc == 2 && std::string(argv[1]) == "--toolbar") {
+        testGripColors();
+        testPresetMenuItems();
+        testPresetMenuInteractions();
+        std::puts("Windows toolbar: About styling, keyboard focus, closing and preset interactions passed");
+        return 0;
+    }
     testClassLifetime();
     testEditorKeyboard();
     testTextClipboard();

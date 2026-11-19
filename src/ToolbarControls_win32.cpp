@@ -151,10 +151,10 @@ INT_PTR CALLBACK WindowsToolbar::aboutProc(HWND window, UINT message, WPARAM wp,
         SetWindowPos(window, nullptr, 0, 0, bounds.right - bounds.left, bounds.bottom - bounds.top,
             SWP_NOMOVE | SWP_NOZORDER);
         HWND link = CreateWindowExW(0, L"BUTTON", wide(kFloopHoleRepository).c_str(),
-            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_FLAT, 10, 180, 400, 30,
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW, 10, 190, 400, 30,
             window, reinterpret_cast<HMENU>(100), toolbar->m_module, nullptr);
         HWND close = CreateWindowExW(0, L"BUTTON", L"Close",
-            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON, 170, 232, 80, 28,
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW, 170, 232, 80, 28,
             window, reinterpret_cast<HMENU>(IDOK), toolbar->m_module, nullptr);
         if (!link || !close) {
             fprintf(stderr, "FloopHole: could not create About controls (%lu)\n", GetLastError());
@@ -163,6 +163,54 @@ INT_PTR CALLBACK WindowsToolbar::aboutProc(HWND window, UINT message, WPARAM wp,
         return TRUE;
     }
     if (!toolbar) return FALSE;
+    if (message == WM_SETCURSOR && reinterpret_cast<HWND>(wp) == GetDlgItem(window, 100) &&
+            LOWORD(lp) == HTCLIENT) {
+        SetCursor(LoadCursor(nullptr, IDC_HAND));
+        SetWindowLongPtrW(window, DWLP_MSGRESULT, TRUE);
+        return TRUE;
+    }
+    if (message == WM_DRAWITEM) {
+        const auto* item = reinterpret_cast<const DRAWITEMSTRUCT*>(lp);
+        if (item->CtlType != ODT_BUTTON || (item->CtlID != 100 && item->CtlID != IDOK)) return FALSE;
+        const bool link = item->CtlID == 100;
+        const bool pressed = (item->itemState & ODS_SELECTED) != 0;
+        const bool focused = (item->itemState & (ODS_FOCUS | ODS_NOFOCUSRECT)) == ODS_FOCUS;
+        {
+            Gdiplus::Graphics graphics(item->hDC);
+            const auto& rect = item->rcItem;
+            Gdiplus::RectF bounds(static_cast<float>(rect.left), static_cast<float>(rect.top),
+                static_cast<float>(rect.right - rect.left), static_cast<float>(rect.bottom - rect.top));
+            Gdiplus::SolidBrush background(color(ToolbarTheme::background));
+            graphics.FillRectangle(&background, bounds);
+            graphics.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+            graphics.SetTextRenderingHint(Gdiplus::TextRenderingHintAntiAliasGridFit);
+            if (!link) {
+                Gdiplus::GraphicsPath path;
+                rounded(path, bounds.X + 0.5f, bounds.Y + 0.5f, bounds.Width - 1, bounds.Height - 1);
+                Gdiplus::LinearGradientBrush fill(Gdiplus::PointF(bounds.X, bounds.Y),
+                    Gdiplus::PointF(bounds.X, bounds.GetBottom()), color(ToolbarTheme::controlTop),
+                    color(pressed ? ToolbarTheme::border : ToolbarTheme::controlBottom));
+                graphics.FillPath(&fill, &path);
+                Gdiplus::Pen outline(color(focused ? ToolbarTheme::selected : ToolbarTheme::border));
+                graphics.DrawPath(&outline, &path);
+            }
+            Gdiplus::Font font(L"Segoe UI", 12,
+                link ? Gdiplus::FontStyleUnderline : Gdiplus::FontStyleRegular, Gdiplus::UnitPixel);
+            Gdiplus::SolidBrush foreground(color(link ? (pressed ? 0x8AC4FF : 0x4DA3FF) : ToolbarTheme::text));
+            Gdiplus::StringFormat centered = editorStringFormat();
+            centered.SetAlignment(Gdiplus::StringAlignmentCenter);
+            centered.SetLineAlignment(Gdiplus::StringAlignmentCenter);
+            graphics.DrawString(link ? wide(kFloopHoleRepository).c_str() : L"Close", -1,
+                &font, bounds, &centered, &foreground);
+        }
+        if (link && focused) {
+            RECT focus = item->rcItem;
+            InflateRect(&focus, -2, -2);
+            DrawFocusRect(item->hDC, &focus);
+        }
+        SetWindowLongPtrW(window, DWLP_MSGRESULT, TRUE);
+        return TRUE;
+    }
     if (message == WM_COMMAND) {
         if (LOWORD(wp) == IDOK || LOWORD(wp) == IDCANCEL) EndDialog(window, LOWORD(wp));
         else if (LOWORD(wp) == 100) {
