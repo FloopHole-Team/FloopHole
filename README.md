@@ -12,20 +12,6 @@ Building FloopHole does not require FL Studio. **Using it requires a local,
 licensed FL Studio installation and the appropriate licenses for the plugins
 you use.** FL Studio and its plugins are not downloaded or bundled by this project.
 
-To save the current plugin sound or effect settings, click the diskette next to
-**Load preset**. **Save preset as...** opens the active plugin's user preset folder.
-Choose a filename to save an `.fst` and select it immediately in the preset
-dropdown. Presets saved in the default folder are found again on restart.
-
-Click the toolbar logo to open **About FloopHole**, with a larger logo, the
-compiled version and a link to the [GitHub repository](https://github.com/FloopHole-Team/FloopHole).
-The first release heading in [changelog.md](./changelog.md) supplies the version
-for the About window, VST3 metadata and macOS bundle when building.
-
-Cut, copy and paste use **Ctrl+X/C/V** on Windows and **Command+X/C/V** on macOS
-inside Fruity NoteBook, Fruity NoteBook 2 and Edison. Click the native writing
-surface or waveform first; shortcuts outside the editor remain with the host.
-
 ## License and legal notices
 
 FloopHole's original code is released under the [MIT License](./LICENSE).
