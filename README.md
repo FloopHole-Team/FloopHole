@@ -101,48 +101,6 @@ ditto build/VST3/FloopHole.vst3 "$HOME/Library/Audio/Plug-Ins/VST3/FloopHole.vst
 Quit your DAW before replacing an installed bundle, then restart it. An already
 loaded plugin continues running the old code even if the bundle on disk changes.
 
-### macOS native editor checks
-
-The native editor container must follow the non-overlapping toolbar/footer views:
-MacVCL's fallback view search otherwise discards the form it already found.
-This ordering preserves native control lookup and hover help across instruments
-and effects.
-
-With a local FL Studio installation, run the loaded-VST regressions:
-
-```sh
-cmake --build build --target FloopHole test_vst3 --parallel
-build/test_vst3 --native-hover-help
-build/test_vst3 --edison-vst-poll
-build/test_vst3 --edison-clipboard
-build/test_vst3 --notebook-keyboard
-build/test_vst3 --notebook-appkit-keyboard
-build/test_vst3 --notebook-caret
-```
-
-These check visible hover-help text and native Edison hover/leave state using
-the VST's real idle timer, plus Notebook typing/editing through host key
-callbacks and AppKit responders, saved-state restoration, and duplicate-delivery
-protection when a host invokes both keyboard APIs. Clipboard tests use an isolated
-pasteboard, checking actual Notebook text and Edison cut/paste audio state.
-The Notebook tests also check opening and reopening the About window.
-They do not replace checking
-the editor in the DAW.
-
-On Windows, the `test_windows_editor` target checks the About dialog, VCL
-shortcut forwarding and real Edit/RichEdit clipboard round-trips without
-duplicate pastes. It restores the previous clipboard contents after testing.
-
-Notebook typing/editing supports Cocoa responder events (used by Live) as well
-as VST key callbacks, only while a notebook writing surface has focus.
-Native activation notifications restore the blinking insertion caret after
-selection, refocusing and reopening. The caret regression checks thin-bar pixel
-changes in the native canvas across multiple blink cycles; it selects Metal
-only within the test process and does not change FL Studio's saved preferences.
-Fruity HTML Notebook is an
-[HTML viewer](https://www.image-line.com/fl-studio-learning/fl-studio-online-manual/html/plugins/Fruity%20HTML%20NoteBook.htm),
-not a text editor: load an externally edited HTML document with its file button.
-
 ## Build on Windows
 
 Requirements: Git for Windows, CMake 3.20+, and Visual Studio 2022 (or Build Tools)
